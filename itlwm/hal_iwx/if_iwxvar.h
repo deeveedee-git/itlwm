@@ -693,6 +693,8 @@ struct iwx_softc {
 
 	int sc_intmask;
 	int sc_flags;
+	/* A scan was aborted; its completion must not end the next scan. */
+	bool sc_scan_abort_pending;
 
 	uint32_t sc_fh_init_mask;
 	uint32_t sc_hw_init_mask;

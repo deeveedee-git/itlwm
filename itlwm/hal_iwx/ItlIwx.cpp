@@ -9264,8 +9264,10 @@ iwx_scan_abort(struct iwx_softc *sc)
     int err;
     
     err = iwx_umac_scan_abort(sc);
-    if (err == 0)
+    if (err == 0) {
         sc->sc_flags &= ~(IWX_FLAG_SCANNING | IWX_FLAG_BGSCAN);
+        sc->sc_scan_abort_pending = true;
+    }
     return err;
 }
 
@@ -10421,12 +10423,24 @@ iwx_newstate_task(void *psc)
              */
             if (ic->ic_join_now) {
                 ic->ic_join_now = false;
+                ic->ic_scan_restart = false;
                 if (!(sc->sc_flags & IWX_FLAG_SCANNING) ||
                     that->iwx_scan_abort(sc) == 0) {
                     ieee80211_end_scan(&ic->ic_if);
                     splx(s);
                     return;
                 }
+            }
+            /*
+             * A system scan request arrived during our scan: start over
+             * with the channels it asked for. If the abort fails, the
+             * request completes with the scan in progress.
+             */
+            if (ic->ic_scan_restart) {
+                ic->ic_scan_restart = false;
+                if (!(sc->sc_flags & IWX_FLAG_SCANNING) ||
+                    that->iwx_scan_abort(sc) == 0)
+                    goto next_scan;
             }
             if (sc->sc_flags & IWX_FLAG_SCANNING) {
                 //                refcnt_rele_wake(&sc->task_refs);
@@ -11226,6 +11240,8 @@ iwx_stop(struct _ifnet *ifp)
     ifp->if_flags &= ~IFF_RUNNING;
 #ifdef AIRPORT_WCL
     // A stopped firmware scan cannot deliver its completion event.
+    sc->sc_scan_abort_pending = false;
+    ic->ic_scan_restart = false;
     ic->ic_flags &= ~(IEEE80211_F_BGSCAN | IEEE80211_F_ASCAN);
     ic->ic_wcl_scan_requested = false;
     ic->ic_wcl_scan_active = false;
@@ -11926,6 +11942,11 @@ iwx_rx_pkt(struct iwx_softc *sc, struct iwx_rx_data *data, struct mbuf_list *ml)
             case IWX_SCAN_COMPLETE_UMAC: {
                 struct iwx_umac_scan_complete *notif;
                 SYNC_RESP_STRUCT(notif, pkt, struct iwx_umac_scan_complete *);
+                /* The end of an aborted scan, not of the one that followed. */
+                if (sc->sc_scan_abort_pending &&
+                    notif->status == IWX_SCAN_OFFLOAD_ABORTED)
+                    break;
+                sc->sc_scan_abort_pending = false;
                 iwx_endscan(sc);
                 break;
             }
@@ -11933,6 +11954,10 @@ iwx_rx_pkt(struct iwx_softc *sc, struct iwx_rx_data *data, struct mbuf_list *ml)
             case IWX_SCAN_ITERATION_COMPLETE_UMAC: {
                 struct iwx_umac_scan_iter_complete_notif *notif;
                 SYNC_RESP_STRUCT(notif, pkt, struct iwx_umac_scan_iter_complete_notif *);
+                if (sc->sc_scan_abort_pending &&
+                    notif->status == IWX_SCAN_OFFLOAD_ABORTED)
+                    break;
+                sc->sc_scan_abort_pending = false;
                 iwx_endscan(sc);
                 break;
             }
