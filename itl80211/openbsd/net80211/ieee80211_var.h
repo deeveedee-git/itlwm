@@ -462,6 +462,12 @@ struct ieee80211com {
      * covers only this channel; it is cleared when that scan is started.
      */
     uint8_t         ic_join_chan;
+    /*
+     * Set with a SCAN -> SCAN transition by a system scan request: the driver
+     * restarts the scan in progress, so that the requested channels are
+     * scanned while the request is pending.
+     */
+    bool            ic_scan_restart;
     void            (*ic_event_handler)(struct ieee80211com *, int, void *);
 	CTimeout*		ic_bgscan_timeout;
 	uint32_t		ic_bgscan_fail;

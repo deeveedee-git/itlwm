@@ -275,7 +275,18 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLScan(apple80211ScanRequest *reque
             scanSource->cancelTimeout();
             return kIOReturnBusy;
         }
-    } else if (ic->ic_state != IEEE80211_S_SCAN) {
+    } else if (ic->ic_state == IEEE80211_S_SCAN) {
+        /*
+         * The driver's own scan is running and may already be past the
+         * requested channels, and the system keeps only the results that
+         * arrive while its request is pending. Restart the scan with the
+         * requested channels (see ic_scan_restart); its end completes
+         * this request.
+         */
+        scanSkipCompletion = false;
+        ic->ic_scan_restart = true;
+        ic->ic_newstate(ic, IEEE80211_S_SCAN, -1);
+    } else {
         int error = ic->ic_newstate(ic, IEEE80211_S_SCAN, -1);
         if (error) {
             scanPending = false;
