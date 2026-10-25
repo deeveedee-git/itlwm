@@ -7900,7 +7900,11 @@ iwx_umac_scan_fill_channels(struct iwx_softc *sc,
     struct ieee80211com *ic = &sc->sc_ic;
     struct ieee80211_channel *c;
     uint8_t nchan;
+    /* A join request asked for one scan of its BSS channel only. */
+    uint8_t join_chan = bgscan ? 0 : ic->ic_join_chan;
     
+    if (!bgscan)
+        ic->ic_join_chan = 0;
     for (nchan = 0, c = &ic->ic_channels[1];
          c <= &ic->ic_channels[IEEE80211_CHAN_MAX] &&
          nchan < sc->sc_capa_n_scan_channels;
@@ -7908,6 +7912,8 @@ iwx_umac_scan_fill_channels(struct iwx_softc *sc,
         uint8_t channel_num;
         
         if (c->ic_flags == 0)
+            continue;
+        if (join_chan && ieee80211_chan2ieee(ic, c) != join_chan)
             continue;
 #ifdef AIRPORT_WCL
         if (!AirportWCL::scanChannelSelected(ic->ic_wcl_scan_channels,
@@ -10419,6 +10425,23 @@ iwx_newstate_task(void *psc)
     
     if (ostate == IEEE80211_S_SCAN) {
         if (nstate == ostate) {
+            /*
+             * A join request arrived while we scan or between scans. The BSS
+             * is normally already in the node table from the scan that
+             * preceded the request; choose from the table now (ending a scan
+             * in progress) rather than wait for a full scan, which can
+             * exceed the system's association timeout. If the BSS is
+             * missing, end_scan starts another scan as usual.
+             */
+            if (ic->ic_join_now) {
+                ic->ic_join_now = false;
+                if (!(sc->sc_flags & IWX_FLAG_SCANNING) ||
+                    that->iwx_scan_abort(sc) == 0) {
+                    ieee80211_end_scan(&ic->ic_if);
+                    splx(s);
+                    return;
+                }
+            }
             if (sc->sc_flags & IWX_FLAG_SCANNING) {
                 //                refcnt_rele_wake(&sc->task_refs);
                 splx(s);
