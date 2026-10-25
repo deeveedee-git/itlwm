@@ -612,6 +612,12 @@ struct iwx_softc {
     struct iwx_ba_task_data    ba_tx;
     
     struct iwx_tid_data sc_tid_data[IWX_MAX_TID_COUNT + 1];//per tid data + mgmt. Look at %iwx_tid_data.
+    /*
+     * TIDs of IWX_STATION_ID that own a firmware Tx queue added with
+     * SCD_QUEUE_CONFIG_CMD. That API removes queues by (station, TID) and
+     * requires the removal before the station itself is removed.
+     */
+    uint32_t sc_scd_tid_mask;
 
     /* Task for ERP/HT prot/slot-time/EDCA updates. */
     struct task        mac_ctxt_task;
