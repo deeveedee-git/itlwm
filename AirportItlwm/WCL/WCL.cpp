@@ -515,6 +515,18 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
     ic->ic_wcl_scan_requested = false;
     current_authtype_lower = join.lowerAuth;
     current_authtype_upper = join.upperAuth;
+    /*
+     * The join request names the BSS channel (chanspec, channel number in
+     * the low byte). The node table is often empty here (e.g. after the
+     * firmware restart that applies a new MAC address), and a full scan
+     * takes nearly the system's ~4 s association timeout; scan only this
+     * channel first.
+     */
+    {
+        unsigned channel = join.channelSpec & 0xff;
+        ic->ic_join_chan = (channel > 0 && channel <= IEEE80211_CHAN_MAX &&
+                            ic->ic_channels[channel].ic_flags) ? channel : 0;
+    }
     explicit_bzero(&join, sizeof(join));
     wclBssValid = false;
     joinPending = true;
@@ -523,6 +535,14 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
     bzero(wclBeaconInfo, sizeof(wclBeaconInfo));
     disassocIsVoluntary = false;
     joinTimer->setTimeoutMS(30000);
+    /*
+     * Already scanning: end that scan now and choose from the node table
+     * instead of waiting for it to finish (see ic_join_now).
+     */
+    if (ic->ic_state == IEEE80211_S_SCAN) {
+        ic->ic_join_now = true;
+        ic->ic_newstate(ic, IEEE80211_S_SCAN, -1);
+    }
     if (ic->ic_state != IEEE80211_S_SCAN && ic->ic_newstate(ic, IEEE80211_S_SCAN, -1)) {
         joinPending = false;
         joinTimer->cancelTimeout();

@@ -452,6 +452,16 @@ struct ieee80211com {
     uint64_t ic_wcl_tx_packets[4];
     uint64_t ic_wcl_rx_packets[4];
 #endif
+    /*
+     * Set with a SCAN -> SCAN transition by a join request: the driver ends
+     * the scan in progress and selects the BSS from the current node table.
+     */
+    bool            ic_join_now;
+    /*
+     * Channel of the BSS a join request named (0 = unknown). The next scan
+     * covers only this channel; it is cleared when that scan is started.
+     */
+    uint8_t         ic_join_chan;
     void            (*ic_event_handler)(struct ieee80211com *, int, void *);
 	CTimeout*		ic_bgscan_timeout;
 	uint32_t		ic_bgscan_fail;
