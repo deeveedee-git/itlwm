@@ -3430,6 +3430,7 @@ iwx_enable_txq(struct iwx_softc *sc, int sta_id, int qid, int tid,
     
     XYLog("%s\n", __FUNCTION__);
     struct iwx_tx_queue_cfg_cmd cmd;
+    struct iwx_scd_queue_cfg_cmd cmd_v3;
     struct iwx_rx_packet *pkt;
     struct iwx_tx_queue_cfg_rsp *resp;
     struct iwx_host_cmd hcmd = {
@@ -3441,20 +3442,33 @@ iwx_enable_txq(struct iwx_softc *sc, int sta_id, int qid, int tid,
     int err, fwqid;
     uint32_t wr_idx;
     size_t resp_len;
-    
+
     iwx_reset_tx_ring(sc, ring);
-    
-    memset(&cmd, 0, sizeof(cmd));
-    cmd.sta_id = sta_id;
-    cmd.tid = tid;
-    cmd.flags = htole16(IWX_TX_QUEUE_CFG_ENABLE_QUEUE);
-    cmd.cb_size = htole32(IWX_TFD_QUEUE_CB_SIZE(num_slots));
-    cmd.byte_cnt_addr = htole64(ring->bc_tbl.paddr);
-    cmd.tfdq_addr = htole64(ring->desc_dma.paddr);
-    
-    hcmd.data[0] = &cmd;
-    hcmd.len[0] = sizeof(cmd);
-    
+
+    if (iwx_scd_queue_cmd_ver(sc) == 3) {
+        memset(&cmd_v3, 0, sizeof(cmd_v3));
+        cmd_v3.operation = htole32(IWX_SCD_QUEUE_ADD);
+        cmd_v3.u.add.sta_mask = htole32(1 << sta_id);
+        cmd_v3.u.add.tid = tid;
+        cmd_v3.u.add.flags = htole32(0);
+        cmd_v3.u.add.cb_size = htole32(IWX_TFD_QUEUE_CB_SIZE(num_slots));
+        cmd_v3.u.add.bc_dram_addr = htole64(ring->bc_tbl.paddr);
+        cmd_v3.u.add.tfdq_dram_addr = htole64(ring->desc_dma.paddr);
+        hcmd.id = IWX_WIDE_ID(IWX_DATA_PATH_GROUP, IWX_SCD_QUEUE_CONFIG_CMD);
+        hcmd.data[0] = &cmd_v3;
+        hcmd.len[0] = sizeof(cmd_v3);
+    } else {
+        memset(&cmd, 0, sizeof(cmd));
+        cmd.sta_id = sta_id;
+        cmd.tid = tid;
+        cmd.flags = htole16(IWX_TX_QUEUE_CFG_ENABLE_QUEUE);
+        cmd.cb_size = htole32(IWX_TFD_QUEUE_CB_SIZE(num_slots));
+        cmd.byte_cnt_addr = htole64(ring->bc_tbl.paddr);
+        cmd.tfdq_addr = htole64(ring->desc_dma.paddr);
+        hcmd.data[0] = &cmd;
+        hcmd.len[0] = sizeof(cmd);
+    }
+
     err = iwx_send_cmd(sc, &hcmd);
     if (err)
         return err;
@@ -3556,6 +3570,8 @@ iwx_tvqm_enable_txq(struct iwx_softc *sc, int tid, int ssn, uint32_t size)
         .sta_id = IWX_STATION_ID,
         .tid = (uint8_t)tid,
     };
+    struct iwx_scd_queue_cfg_cmd cmd_v3;
+    int scd_ver = iwx_scd_queue_cmd_ver(sc);
     struct iwx_rx_packet *pkt;
     struct iwx_tx_queue_cfg_rsp *resp;
     struct iwx_host_cmd hcmd = {
@@ -3620,12 +3636,34 @@ iwx_tvqm_enable_txq(struct iwx_softc *sc, int tid, int ssn, uint32_t size)
             goto fail;
         }
     }
-    cmd.cb_size = htole32(IWX_TFD_QUEUE_CB_SIZE(ring->ring_count));
-    cmd.byte_cnt_addr = htole64(ring->bc_tbl.paddr);
-    cmd.tfdq_addr = htole64(ring->desc_dma.paddr);
-
-    hcmd.data[0] = &cmd;
-    hcmd.len[0] = sizeof(cmd);
+    if (scd_ver == 3) {
+        /*
+         * The firmware keeps one queue per (station, TID). A queue left
+         * from an earlier block-ack session of this TID must be removed
+         * before a new one can be added.
+         */
+        if (sc->sc_scd_tid_mask & (1 << tid)) {
+            iwx_scd_queue_remove(sc, IWX_STATION_ID, tid);
+            sc->sc_scd_tid_mask &= ~(1 << tid);
+        }
+        memset(&cmd_v3, 0, sizeof(cmd_v3));
+        cmd_v3.operation = htole32(IWX_SCD_QUEUE_ADD);
+        cmd_v3.u.add.sta_mask = htole32(1 << IWX_STATION_ID);
+        cmd_v3.u.add.tid = (uint8_t)tid;
+        cmd_v3.u.add.flags = htole32(0);
+        cmd_v3.u.add.cb_size = htole32(IWX_TFD_QUEUE_CB_SIZE(ring->ring_count));
+        cmd_v3.u.add.bc_dram_addr = htole64(ring->bc_tbl.paddr);
+        cmd_v3.u.add.tfdq_dram_addr = htole64(ring->desc_dma.paddr);
+        hcmd.id = IWX_WIDE_ID(IWX_DATA_PATH_GROUP, IWX_SCD_QUEUE_CONFIG_CMD);
+        hcmd.data[0] = &cmd_v3;
+        hcmd.len[0] = sizeof(cmd_v3);
+    } else {
+        cmd.cb_size = htole32(IWX_TFD_QUEUE_CB_SIZE(ring->ring_count));
+        cmd.byte_cnt_addr = htole64(ring->bc_tbl.paddr);
+        cmd.tfdq_addr = htole64(ring->desc_dma.paddr);
+        hcmd.data[0] = &cmd;
+        hcmd.len[0] = sizeof(cmd);
+    }
 
 #ifdef AIRPORT_VTD
     submitted = true;
@@ -3657,6 +3695,8 @@ iwx_tvqm_enable_txq(struct iwx_softc *sc, int tid, int ssn, uint32_t size)
     resp = (struct iwx_tx_queue_cfg_rsp *)pkt->data;
     fwqid = le16toh(resp->queue_number);
     wr_idx = le16toh(resp->write_pointer);
+    if (scd_ver == 3)
+        sc->sc_scd_tid_mask |= 1 << tid;
     if (fwqid >= ARRAY_SIZE(sc->txq)) {
         XYLog("queue index %d unsupported", fwqid);
         err = -EIO;
@@ -3680,6 +3720,14 @@ iwx_tvqm_enable_txq(struct iwx_softc *sc, int tid, int ssn, uint32_t size)
     iwx_free_resp(sc, &hcmd);
     return fwqid;
 fail:
+    /*
+     * Release a queue the firmware added but we could not accept
+     * (not when the device went away while the command was in flight).
+     */
+    if (scd_ver == 3 && err != -ENXIO && (sc->sc_scd_tid_mask & (1 << tid))) {
+        iwx_scd_queue_remove(sc, IWX_STATION_ID, tid);
+        sc->sc_scd_tid_mask &= ~(1 << tid);
+    }
 #ifdef AIRPORT_VTD
     if (submitted)
         sc->sc_dmat->deferRecycling();
@@ -3692,6 +3740,60 @@ fail:
 #ifdef AIRPORT_VTD
     delete ring;
 #endif
+    return err;
+}
+
+/*
+ * Version of the DATA_PATH_GROUP SCD_QUEUE_CONFIG_CMD queue API; 3 for
+ * firmware that dropped the old SCD_QUEUE_CFG command (e.g. API -77),
+ * 0 when the old command must be used.
+ */
+int ItlIwx::
+iwx_scd_queue_cmd_ver(struct iwx_softc *sc)
+{
+    int ver = iwx_lookup_cmd_ver(sc, IWX_DATA_PATH_GROUP,
+                                 IWX_SCD_QUEUE_CONFIG_CMD);
+    return ver == IWX_FW_CMD_VER_UNKNOWN ? 0 : ver;
+}
+
+int ItlIwx::
+iwx_scd_queue_remove(struct iwx_softc *sc, int sta_id, int tid)
+{
+    struct iwx_scd_queue_cfg_cmd cmd;
+    int err;
+
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.operation = htole32(IWX_SCD_QUEUE_REMOVE);
+    cmd.u.remove.sta_mask = htole32(1 << sta_id);
+    cmd.u.remove.tid = htole32(tid);
+    err = iwx_send_cmd_pdu(sc, IWX_WIDE_ID(IWX_DATA_PATH_GROUP,
+                           IWX_SCD_QUEUE_CONFIG_CMD), 0, sizeof(cmd), &cmd);
+    if (err)
+        XYLog("%s: could not remove Tx queue of sta %d tid %d (error %d)\n",
+              DEVNAME(sc), sta_id, tid, err);
+    return err;
+}
+
+/*
+ * The SCD_QUEUE_CONFIG_CMD API requires removing the station's queues
+ * (management and per-TID) before the station is removed.
+ */
+int ItlIwx::
+iwx_scd_remove_sta_queues(struct iwx_softc *sc)
+{
+    int err, tid;
+
+    if (iwx_scd_queue_cmd_ver(sc) != 3)
+        return 0;
+    for (tid = 0; tid < IWX_MAX_TID_COUNT; tid++) {
+        if (!(sc->sc_scd_tid_mask & (1 << tid)))
+            continue;
+        iwx_scd_queue_remove(sc, IWX_STATION_ID, tid);
+        sc->sc_scd_tid_mask &= ~(1 << tid);
+        sc->sc_tid_data[tid].qid = IWX_INVALID_QUEUE;
+    }
+    err = iwx_scd_queue_remove(sc, IWX_STATION_ID, IWX_MGMT_TID);
+    sc->sc_scd_tid_mask = 0;
     return err;
 }
 
@@ -3802,7 +3904,8 @@ iwx_schedule_protect_session(struct iwx_softc *sc, struct iwx_node *in,
         .id_and_color =
             htole32(IWX_FW_CMD_ID_AND_COLOR(in->in_id, in->in_color)),
         .action = htole32(IWX_FW_CTXT_ACTION_ADD),
-        .duration_tu = htole32(duration * IEEE80211_DUR_TU),
+        /* The firmware expects TU; duration is already in TU. */
+        .duration_tu = htole32(duration),
     };
     int err;
     
@@ -4285,6 +4388,52 @@ iwx_setup_he_rates(struct iwx_softc *sc)
 #define IWX_MAX_RX_BA_SESSIONS 16
 
 int ItlIwx::
+iwx_sta_rx_agg_baid_cfg_cmd(struct iwx_softc *sc, uint8_t tid, uint16_t ssn,
+                            uint16_t winsize, int start, uint8_t *baid)
+{
+    struct iwx_rx_baid_cfg_cmd cmd;
+    uint32_t new_baid = 0;
+    int err, i;
+
+    memset(&cmd, 0, sizeof(cmd));
+    if (start) {
+        cmd.action = htole32(IWX_RX_BAID_ACTION_ADD);
+        cmd.alloc.sta_id_mask = htole32(1 << IWX_STATION_ID);
+        cmd.alloc.tid = tid;
+        cmd.alloc.ssn = htole16(ssn);
+        cmd.alloc.win_size = htole16(winsize);
+    } else {
+        for (i = 0; i < nitems(sc->sc_rxba_data); i++) {
+            if (sc->sc_rxba_data[i].baid != IWX_RX_REORDER_DATA_INVALID_BAID &&
+                sc->sc_rxba_data[i].tid == tid)
+                break;
+        }
+        if (i == nitems(sc->sc_rxba_data))
+            return ENOENT;
+        cmd.action = htole32(IWX_RX_BAID_ACTION_REMOVE);
+        if (iwx_lookup_cmd_ver(sc, IWX_DATA_PATH_GROUP,
+                               IWX_RX_BAID_ALLOCATION_CONFIG_CMD) == 1) {
+            cmd.remove_v1.baid = htole32(sc->sc_rxba_data[i].baid);
+        } else {
+            cmd.remove.sta_id_mask = htole32(1 << IWX_STATION_ID);
+            cmd.remove.tid = htole32(tid);
+        }
+    }
+
+    /* The response holds the allocated BAID where ADD_STA has a status. */
+    err = iwx_send_cmd_pdu_status(sc, IWX_WIDE_ID(IWX_DATA_PATH_GROUP,
+                                  IWX_RX_BAID_ALLOCATION_CONFIG_CMD), sizeof(cmd), &cmd, &new_baid);
+    if (err)
+        return err;
+    if (start) {
+        if (new_baid >= nitems(sc->sc_rxba_data))
+            return ERANGE;
+        *baid = new_baid;
+    }
+    return 0;
+}
+
+int ItlIwx::
 iwx_sta_rx_agg(struct iwx_softc *sc, struct ieee80211_node *ni, uint8_t tid,
                uint16_t ssn, uint16_t winsize, int timeout_val, int start)
 {
@@ -4305,47 +4454,64 @@ iwx_sta_rx_agg(struct iwx_softc *sc, struct ieee80211_node *ni, uint8_t tid,
         return ENOSPC;
     }
     
-    memset(&cmd, 0, sizeof(cmd));
-    
-    cmd.sta_id = IWX_STATION_ID;
-    cmd.mac_id_n_color
-    = htole32(IWX_FW_CMD_ID_AND_COLOR(in->in_id, in->in_color));
-    cmd.add_modify = IWX_STA_MODE_MODIFY;
-    
-    if (start) {
-        cmd.add_immediate_ba_tid = (uint8_t)tid;
-        cmd.add_immediate_ba_ssn = htole16(ssn);
-        cmd.rx_ba_window = htole16(winsize);
+    if (isset(sc->sc_enabled_capa, IWX_UCODE_TLV_CAPA_BAID_ML_SUPPORT)) {
+        /* Newer firmware allocates Rx BA sessions with a dedicated command. */
+        err = iwx_sta_rx_agg_baid_cfg_cmd(sc, tid, ssn, winsize, start, &baid);
+        if (generation != sc->sc_generation) {
+            splx(s);
+            return ENXIO;
+        }
+        if (err) {
+            if (start)
+                ieee80211_addba_req_refuse(ic, ni, tid);
+            splx(s);
+            return err;
+        }
     } else {
-        cmd.remove_immediate_ba_tid = (uint8_t)tid;
-    }
-    cmd.modify_mask = start ? IWX_STA_MODIFY_ADD_BA_TID :
-    IWX_STA_MODIFY_REMOVE_BA_TID;
-    
-    status = IWX_ADD_STA_SUCCESS;
-    err = iwx_send_cmd_pdu_status(sc, IWX_ADD_STA, sizeof(cmd), &cmd,
-                                  &status);
-    
-    if (generation != sc->sc_generation) {
-        splx(s);
-        return ENXIO;
-    }
-    if (err || (status & IWX_ADD_STA_STATUS_MASK) != IWX_ADD_STA_SUCCESS) {
-        if (start)
-            ieee80211_addba_req_refuse(ic, ni, tid);
-        splx(s);
-        return err ? err : EIO;
+        memset(&cmd, 0, sizeof(cmd));
+        
+        cmd.sta_id = IWX_STATION_ID;
+        cmd.mac_id_n_color
+        = htole32(IWX_FW_CMD_ID_AND_COLOR(in->in_id, in->in_color));
+        cmd.add_modify = IWX_STA_MODE_MODIFY;
+        
+        if (start) {
+            cmd.add_immediate_ba_tid = (uint8_t)tid;
+            cmd.add_immediate_ba_ssn = htole16(ssn);
+            cmd.rx_ba_window = htole16(winsize);
+        } else {
+            cmd.remove_immediate_ba_tid = (uint8_t)tid;
+        }
+        cmd.modify_mask = start ? IWX_STA_MODIFY_ADD_BA_TID :
+        IWX_STA_MODIFY_REMOVE_BA_TID;
+        
+        status = IWX_ADD_STA_SUCCESS;
+        err = iwx_send_cmd_pdu_status(sc, IWX_ADD_STA, sizeof(cmd), &cmd,
+                                      &status);
+        
+        if (generation != sc->sc_generation) {
+            splx(s);
+            return ENXIO;
+        }
+        if (err || (status & IWX_ADD_STA_STATUS_MASK) != IWX_ADD_STA_SUCCESS) {
+            if (start)
+                ieee80211_addba_req_refuse(ic, ni, tid);
+            splx(s);
+            return err ? err : EIO;
+        }
+        if (start) {
+            if (!(status & IWX_ADD_STA_BAID_VALID_MASK)) {
+                ieee80211_addba_req_refuse(ic, ni, tid);
+                splx(s);
+                return EIO;
+            }
+            baid = (status & IWX_ADD_STA_BAID_MASK) >>
+            IWX_ADD_STA_BAID_SHIFT;
+        }
     }
     
     /* Deaggregation is done in hardware. */
     if (start) {
-        if (!(status & IWX_ADD_STA_BAID_VALID_MASK)) {
-            ieee80211_addba_req_refuse(ic, ni, tid);
-            splx(s);
-            return EIO;
-        }
-        baid = (status & IWX_ADD_STA_BAID_MASK) >>
-        IWX_ADD_STA_BAID_SHIFT;
         if (baid == IWX_RX_REORDER_DATA_INVALID_BAID ||
             baid >= nitems(sc->sc_rxba_data)) {
             ieee80211_addba_req_refuse(ic, ni, tid);
@@ -6357,8 +6523,9 @@ iwx_get_ctrl_pos(struct ieee80211com *ic, struct ieee80211_channel *c)
 int ItlIwx::
 iwx_phy_ctxt_cmd_v3(struct iwx_softc *sc, struct iwx_phy_ctxt *ctxt,
     uint8_t chains_static, uint8_t chains_dynamic, uint32_t action,
-    uint32_t apply_time)
+    uint32_t apply_time, int cmdver)
 {
+    int err;
     struct ieee80211com *ic = &sc->sc_ic;
     struct iwx_phy_context_cmd cmd;
     uint8_t active_cnt, idle_cnt;
@@ -6401,13 +6568,39 @@ iwx_phy_ctxt_cmd_v3(struct iwx_softc *sc, struct iwx_phy_ctxt *ctxt,
         idle_cnt = 2;
         active_cnt = 2;
     }
-    
-    cmd.rxchain_info = htole32(iwx_fw_valid_rx_ant(sc) <<
-                               IWX_PHY_RX_CHAIN_VALID_POS);
-    cmd.rxchain_info |= htole32(idle_cnt << IWX_PHY_RX_CHAIN_CNT_POS);
-    cmd.rxchain_info |= htole32(active_cnt <<
-                                IWX_PHY_RX_CHAIN_MIMO_CNT_POS);
-    return iwx_send_cmd_pdu(sc, IWX_PHY_CONTEXT_CMD, 0, sizeof(cmd), &cmd);
+
+    /*
+     * PHY_CONTEXT_CMD_API_VER_4 reserves rxchain_info; the Rx chains are
+     * configured with RLC_CONFIG_CMD after the PHY context exists.
+     */
+    if (cmdver < 4) {
+        cmd.rxchain_info = htole32(iwx_fw_valid_rx_ant(sc) <<
+                                   IWX_PHY_RX_CHAIN_VALID_POS);
+        cmd.rxchain_info |= htole32(idle_cnt << IWX_PHY_RX_CHAIN_CNT_POS);
+        cmd.rxchain_info |= htole32(active_cnt <<
+                                    IWX_PHY_RX_CHAIN_MIMO_CNT_POS);
+    }
+    err = iwx_send_cmd_pdu(sc, IWX_PHY_CONTEXT_CMD, 0, sizeof(cmd), &cmd);
+    if (err || cmdver < 4 || action == IWX_FW_CTXT_ACTION_REMOVE)
+        return err;
+    return iwx_phy_send_rlc(sc, ctxt, idle_cnt, active_cnt);
+}
+
+int ItlIwx::
+iwx_phy_send_rlc(struct iwx_softc *sc, struct iwx_phy_ctxt *ctxt,
+    uint8_t idle_cnt, uint8_t active_cnt)
+{
+    struct iwx_rlc_config_cmd cmd;
+
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.phy_id = htole32(ctxt->id);
+    cmd.rlc.rx_chain_info = htole32(iwx_fw_valid_rx_ant(sc) <<
+                                    IWX_PHY_RX_CHAIN_VALID_POS);
+    cmd.rlc.rx_chain_info |= htole32(idle_cnt << IWX_PHY_RX_CHAIN_CNT_POS);
+    cmd.rlc.rx_chain_info |= htole32(active_cnt <<
+                                     IWX_PHY_RX_CHAIN_MIMO_CNT_POS);
+    return iwx_send_cmd_pdu(sc, iwx_cmd_id(IWX_RLC_CONFIG_CMD,
+                            IWX_DATA_PATH_GROUP, 2), 0, sizeof(cmd), &cmd);
 }
 
 int ItlIwx::
@@ -6468,9 +6661,12 @@ iwx_phy_ctxt_cmd(struct iwx_softc *sc, struct iwx_phy_ctxt *ctxt,
     uint8_t active_cnt, idle_cnt;
     struct ieee80211_channel *chan = ctxt->channel;
     
-    if (iwx_lookup_cmd_ver(sc, IWX_LONG_GROUP, IWX_PHY_CONTEXT_CMD) == 3)
+    int cmdver = iwx_lookup_cmd_ver(sc, IWX_LONG_GROUP, IWX_PHY_CONTEXT_CMD);
+
+    /* v4 has the v3 layout with rxchain_info reserved. */
+    if (cmdver == 3 || cmdver == 4)
         return iwx_phy_ctxt_cmd_v3(sc, ctxt, chains_static,
-                                   chains_dynamic, action, apply_time);
+                                   chains_dynamic, action, apply_time, cmdver);
     
     /*
      * Intel increased the size of the fw_channel_info struct and neglected
@@ -7671,6 +7867,10 @@ iwx_rm_sta(struct iwx_softc *sc, struct iwx_node *in)
             __FUNCTION__, err);
         return err;
     }
+    /* No-op unless the firmware uses the SCD_QUEUE_CONFIG_CMD queue API. */
+    err = iwx_scd_remove_sta_queues(sc);
+    if (err)
+        return err;
     err = iwx_rm_sta_cmd(sc, in);
     if (err) {
         printf("%s: could not remove STA (error %d)\n",
@@ -7997,7 +8197,7 @@ iwx_umac_scan_size(struct iwx_softc *sc)
     
     if (scan_ver == 12)
         return sizeof(iwx_scan_req_umac_v12);
-    else if (scan_ver == 14)
+    else if (scan_ver == 14 || scan_ver == 15)    /* v15: v14 layout plus general flags2 */
         return sizeof(iwx_scan_req_umac_v14);
     
     if (isset(sc->sc_ucode_api, IWX_UCODE_TLV_API_ADAPTIVE_DWELL_V2))
@@ -8114,7 +8314,7 @@ iwx_umac_scan(struct iwx_softc *sc, int bgscan)
     
     if (scan_ver == 12)
         return iwx_umac_scan_v12(sc, bgscan);
-    else if (scan_ver == 14)
+    else if (scan_ver == 14 || scan_ver == 15)    /* v15: v14 layout plus general flags2 */
         return iwx_umac_scan_v14(sc, bgscan);
     
     req_len = iwx_umac_scan_size(sc);
@@ -8804,15 +9004,21 @@ iwx_mac_ctxt_cmd_fill_sta(struct iwx_softc *sc, struct iwx_node *in,
     tsf = letoh64(tsf);
     
     sta->is_assoc = htole32(assoc);
-    sta->dtim_time = htole32(ni->ni_rstamp + dtim_off);
-    sta->dtim_tsf = htole64(tsf + dtim_off);
+    if (assoc) {
+        sta->dtim_time = htole32(ni->ni_rstamp + dtim_off);
+        sta->dtim_tsf = htole64(tsf + dtim_off);
+        sta->assoc_beacon_arrive_time = htole32(ni->ni_rstamp);
+    }
     sta->bi = htole32(ni->ni_intval);
-    sta->bi_reciprocal = htole32(iwx_reciprocal(ni->ni_intval));
     sta->dtim_interval = htole32(ni->ni_intval * ni->ni_dtimperiod);
-    sta->dtim_reciprocal = htole32(iwx_reciprocal(sta->dtim_interval));
+    /*
+     * STA_MAC_DATA_API_S_VER_2 replaced the beacon/DTIM reciprocals with
+     * reserved1 and data_policy (TWT/coex bits); a reciprocal there would
+     * request TWT. Linux and OpenBSD send 0.
+     */
+    sta->data_policy = htole32(0);
     sta->listen_interval = htole32(10);
     sta->assoc_id = htole32(ni->ni_associd);
-    sta->assoc_beacon_arrive_time = htole32(ni->ni_rstamp);
 }
 
 int ItlIwx::
@@ -8849,14 +9055,19 @@ iwx_mac_ctxt_cmd(struct iwx_softc *sc, struct iwx_node *in, uint32_t action,
                                     IWX_MAC_FILTER_IN_BEACON |
                                     IWX_MAC_FILTER_IN_PROBE_REQUEST |
                                     IWX_MAC_FILTER_IN_CRC32);
-    } else if (!assoc || !ni->ni_associd || !ni->ni_dtimperiod)
+    } else if (!assoc || !ni->ni_associd || !ni->ni_dtimperiod) {
     /*
      * Allow beacons to pass through as long as we are not
      * associated or we do not have dtim period information.
      */
         cmd.filter_flags |= htole32(IWX_MAC_FILTER_IN_BEACON);
-    else
-        iwx_mac_ctxt_cmd_fill_sta(sc, in, &cmd.sta, assoc);
+    }
+    /*
+     * Always provide the beacon-related STA data. Newer firmware needs it
+     * before the AUTH frame is sent, otherwise it raises SYSASSERT
+     * 0x2000011A (OpenBSD 36837274ec, diagnosed with Intel).
+     */
+    iwx_mac_ctxt_cmd_fill_sta(sc, in, &cmd.sta, assoc);
     
     if (ni->ni_flags & IEEE80211_NODE_HE) {
         cmd.filter_flags |= htole32(IWX_MAC_FILTER_IN_11AX);
@@ -9077,6 +9288,8 @@ iwx_enable_mgmt_queue(struct iwx_softc *sc)
         sc->first_data_qid = IWX_QID_MGMT - 1;
     else
         sc->first_data_qid = IWX_QID_MGMT;
+
+
     err = iwx_enable_txq(sc, IWX_STATION_ID,
                          sc->first_data_qid, IWX_MGMT_TID,
                          sc->txq[sc->first_data_qid].ring_count);
@@ -9758,8 +9971,8 @@ iwx_auth(struct iwx_softc *sc)
     
     err = iwx_clear_statistics(sc);
     if (err)
-        goto rm_sta;
-    
+        goto rm_mgmt_queue;
+
     /*
      * Prevent the FW from wandering off channel during association
      * by "protecting" the session with a time event.
@@ -9778,13 +9991,21 @@ iwx_auth(struct iwx_softc *sc)
      * will have a slightly lower priority, but more importantly, can be
      * fragmented so that it'll allow other activities to run.
      */
+    /*
+     * Session protection: 900 TU like iwlwifi (OpenBSD a08da3bef5, verified
+     * with Intel). It used to be sent as duration * 1024 "TU" (~210 s).
+     */
     if (isset(sc->sc_enabled_capa, IWX_UCODE_TLV_CAPA_SESSION_PROT_CMD))
-        err = iwx_schedule_protect_session(sc, in, duration);
+        err = iwx_schedule_protect_session(sc, in,
+            in->in_ni.ni_intval ? in->in_ni.ni_intval * 9 : 900);
     else
         iwx_protect_session(sc, in, duration, in->in_ni.ni_intval / 2);
     
     return err;
-    
+
+rm_mgmt_queue:
+    if (generation == sc->sc_generation)
+        iwx_scd_remove_sta_queues(sc);
 rm_sta:
     if (generation == sc->sc_generation)
         iwx_rm_sta_cmd(sc, in);
@@ -10111,6 +10332,13 @@ iwx_delete_key(struct ieee80211com *ic, struct ieee80211_node *ni,
         ieee80211_delete_key(ic, ni, k);
         return;
     }
+    
+    /*
+     * The firmware has no keys for a station it doesn't know; removing one
+     * anyway can panic it (OpenBSD e71130c53c, f40fa9e6cf).
+     */
+    if ((sc->sc_flags & IWX_FLAG_STA_ACTIVE) == 0)
+        return;
     
     memset(&cmd, 0, sizeof(cmd));
     
@@ -10779,7 +11007,8 @@ iwx_init(struct _ifnet *ifp)
     for (i = 0; i < ARRAY_SIZE(sc->sc_tid_data); i++) {
         sc->sc_tid_data[i].qid = IWX_INVALID_QUEUE;
     }
-    
+    sc->sc_scd_tid_mask = 0;
+
     //    rw_assert_wrlock(&sc->ioctl_rwl);
     
     generation = ++sc->sc_generation;
@@ -11614,6 +11843,12 @@ iwx_rx_pkt(struct iwx_softc *sc, struct iwx_rx_data *data, struct mbuf_list *ml)
             case IWX_STATISTICS_NOTIFICATION: {
                 struct iwx_notif_statistics *stats;
                 struct iwx_notif_statistics_v11 *stats_v11;
+                /* Version 15 has a different layout; keep the last noise value. */
+                if (iwx_lookup_notif_ver(sc, IWX_LEGACY_GROUP,
+                                         IWX_STATISTICS_NOTIFICATION) >= 15 &&
+                    iwx_lookup_notif_ver(sc, IWX_LEGACY_GROUP,
+                                         IWX_STATISTICS_NOTIFICATION) != IWX_FW_CMD_VER_UNKNOWN)
+                    break;
                 if (isset(sc->sc_ucode_api, IWX_UCODE_TLV_API_NEW_RX_STATS)) {
                     SYNC_RESP_STRUCT(stats, pkt, struct iwx_notif_statistics *);
                     sc->sc_noise = iwx_get_noise((uint8_t *)&stats->rx.general.beacon_silence_rssi_a);
@@ -11668,7 +11903,10 @@ iwx_rx_pkt(struct iwx_softc *sc, struct iwx_rx_data *data, struct mbuf_list *ml)
             case IWX_MCC_UPDATE_CMD:
             case IWX_TIME_EVENT_CMD:
             case IWX_STATISTICS_CMD:
-            case IWX_SCD_QUEUE_CFG: {
+            case IWX_SCD_QUEUE_CFG:
+            case IWX_WIDE_ID(IWX_DATA_PATH_GROUP, IWX_SCD_QUEUE_CONFIG_CMD):
+            case IWX_WIDE_ID(IWX_DATA_PATH_GROUP, IWX_RX_BAID_ALLOCATION_CONFIG_CMD):
+            case IWX_WIDE_ID(IWX_DATA_PATH_GROUP, IWX_RLC_CONFIG_CMD): {
                 size_t pkt_len;
                 
                 if (qid != IWX_DQA_CMD_QUEUE ||
@@ -11783,6 +12021,11 @@ iwx_rx_pkt(struct iwx_softc *sc, struct iwx_rx_data *data, struct mbuf_list *ml)
                              IWX_NVM_ACCESS_COMPLETE):
                 break;
                 
+            /*
+             * Firmware API -77 reports every beacon with DATA_PATH notification
+             * 0xf8 (BEACON_FILTER_IN_NOTIF in iwlwifi); nothing to do.
+             */
+            case IWX_WIDE_ID(IWX_DATA_PATH_GROUP, 0xf8):
             case IWX_WIDE_ID(IWX_DATA_PATH_GROUP, IWX_RX_NO_DATA_NOTIF):
                 break; /* happens in monitor mode; ignore for now */
             case IWX_WIDE_ID(IWX_DATA_PATH_GROUP, IWX_TLC_MNG_CONFIG_CMD):
@@ -12378,7 +12621,7 @@ const struct iwl_cfg iwl_cfg_so_a0_hr_a0 = {
 };
 
 const struct iwl_cfg iwl_cfg_quz_a0_hr_b0 = {
-    .fwname = "iwlwifi-QuZ-a0-hr-b0-68.ucode",
+    .fwname = "iwlwifi-QuZ-a0-hr-b0-77.ucode",
     .device_family = IWX_DEVICE_FAMILY_22000,
     /*
      * This device doesn't support receiving BlockAck with a large bitmap
@@ -12606,7 +12849,7 @@ const struct iwl_cfg killer1650i_2ax_cfg_qu_c0_hr_b0 = {
 
 const struct iwl_cfg iwl_ax201_cfg_quz_hr = {
     .name = "Intel(R) Wi-Fi 6 AX201 160MHz",
-    .fwname = "iwlwifi-QuZ-a0-hr-b0-68.ucode",
+    .fwname = "iwlwifi-QuZ-a0-hr-b0-77.ucode",
     .device_family = IWX_DEVICE_FAMILY_22000,
     .tx_with_siso_diversity = 0,
     .uhb_supported = 0,
@@ -12621,7 +12864,7 @@ const struct iwl_cfg iwl_ax201_cfg_quz_hr = {
 
 const struct iwl_cfg iwl_ax1650s_cfg_quz_hr = {
     .name = "Killer(R) Wi-Fi 6 AX1650s 160MHz Wireless Network Adapter (201D2W)",
-    .fwname = "iwlwifi-QuZ-a0-hr-b0-68.ucode",
+    .fwname = "iwlwifi-QuZ-a0-hr-b0-77.ucode",
     .device_family = IWX_DEVICE_FAMILY_22000,
     /*
          * This device doesn't support receiving BlockAck with a large bitmap
@@ -12634,7 +12877,7 @@ const struct iwl_cfg iwl_ax1650s_cfg_quz_hr = {
 
 const struct iwl_cfg iwl_ax1650i_cfg_quz_hr = {
     .name = "Killer(R) Wi-Fi 6 AX1650i 160MHz Wireless Network Adapter (201NGW)",
-    .fwname = "iwlwifi-QuZ-a0-hr-b0-68.ucode",
+    .fwname = "iwlwifi-QuZ-a0-hr-b0-77.ucode",
     .device_family = IWX_DEVICE_FAMILY_22000,
     /*
          * This device doesn't support receiving BlockAck with a large bitmap
@@ -12749,7 +12992,7 @@ const struct iwl_cfg iwl_qu_c0_hr1_b0 = {
 };
 
 const struct iwl_cfg iwl_quz_a0_hr1_b0 = {
-    .fwname = "iwlwifi-QuZ-a0-hr-b0-68.ucode",
+    .fwname = "iwlwifi-QuZ-a0-hr-b0-77.ucode",
     .device_family = IWX_DEVICE_FAMILY_22000,
     .tx_with_siso_diversity = 1,
     .uhb_supported = 0,
