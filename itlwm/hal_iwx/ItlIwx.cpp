@@ -7388,6 +7388,21 @@ iwx_power_build_cmd(struct iwx_softc *sc, struct iwx_node *in,
     
     if (ic->ic_opmode != IEEE80211_M_MONITOR)
         cmd->flags = htole16(IWX_POWER_FLAGS_POWER_SAVE_ENA_MSK);
+
+    /*
+     * 802.11 power save while associated as a client, as Linux iwlmvm does by default
+     * (power_scheme "balanced"): the radio dozes between beacons after 100 ms without
+     * RX/TX traffic and wakes for DTIM beacons to collect buffered frames. Without
+     * POWER_MANAGEMENT_ENA the firmware stays in continuously-active mode, which keeps
+     * the platform out of package C10 while Wi-Fi is connected.
+     * The flags sent are published on the PCI device as "ItlwmPMFlags" for verification.
+     */
+    if (ic->ic_opmode == IEEE80211_M_STA) {
+        cmd->flags |= htole16(IWX_POWER_FLAGS_POWER_MANAGEMENT_ENA_MSK);
+        cmd->rx_data_timeout = htole32(IWX_DEFAULT_PS_RX_DATA_TIMEOUT);
+        cmd->tx_data_timeout = htole32(IWX_DEFAULT_PS_TX_DATA_TIMEOUT);
+    }
+    sc->sc_pcitag->setProperty("ItlwmPMFlags", le16toh(cmd->flags), 32);
 }
 
 int ItlIwx::
