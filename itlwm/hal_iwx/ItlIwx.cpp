@@ -8298,12 +8298,13 @@ iwx_umac_scan(struct iwx_softc *sc, int bgscan)
     struct iwx_scan_umac_chan_param *chanparam;
     size_t req_len;
     int err, async = bgscan;
-    const uint32_t timeout = bgscan ?  htole32(120) : htole32(0);
 #ifdef AIRPORT_WCL
     const auto timing = AirportWCL::scanTiming(ic->ic_wcl_scan_away_time_ms, bgscan,
         isset(sc->sc_ucode_api, IWX_UCODE_TLV_API_FRAGMENTED_SCAN));
+    const uint32_t timeout = htole32(timing.suspendTU);
     const uint32_t maxOut = htole32(timing.maxOutTU);
 #else
+    const uint32_t timeout = bgscan ?  htole32(120) : htole32(0);
     const uint32_t maxOut = timeout;
 #endif
     uint8_t scan_ver = iwx_lookup_cmd_ver(sc, IWX_LONG_GROUP, IWX_SCAN_REQ_UMAC);
@@ -8497,12 +8498,13 @@ iwx_umac_scan_v12(struct iwx_softc *sc, int bgscan)
     struct iwx_scan_req_umac_v12 *req;
     size_t req_len;
     uint16_t gen_flags = 0;
-    const uint32_t timeout = bgscan ?  htole32(120) : htole32(0);
 #ifdef AIRPORT_WCL
     const auto timing = AirportWCL::scanTiming(ic->ic_wcl_scan_away_time_ms, bgscan,
         isset(sc->sc_ucode_api, IWX_UCODE_TLV_API_FRAGMENTED_SCAN));
+    const uint32_t timeout = htole32(timing.suspendTU);
     const uint32_t maxOut = htole32(timing.maxOutTU);
 #else
+    const uint32_t timeout = bgscan ?  htole32(120) : htole32(0);
     const uint32_t maxOut = timeout;
 #endif
     struct iwx_scan_general_params_v10 *general_params;
@@ -8626,12 +8628,13 @@ iwx_umac_scan_v14(struct iwx_softc *sc, int bgscan)
     uint16_t gen_flags = 0;
     struct iwx_scan_general_params_v10 *general_params;
     struct iwx_scan_channel_params_v6 *cp;
-    const uint32_t timeout = bgscan ?  htole32(120) : htole32(0);
 #ifdef AIRPORT_WCL
     const auto timing = AirportWCL::scanTiming(ic->ic_wcl_scan_away_time_ms, bgscan,
         isset(sc->sc_ucode_api, IWX_UCODE_TLV_API_FRAGMENTED_SCAN));
+    const uint32_t timeout = htole32(timing.suspendTU);
     const uint32_t maxOut = htole32(timing.maxOutTU);
 #else
+    const uint32_t timeout = bgscan ?  htole32(120) : htole32(0);
     const uint32_t maxOut = timeout;
 #endif
     struct iwx_host_cmd hcmd = {
