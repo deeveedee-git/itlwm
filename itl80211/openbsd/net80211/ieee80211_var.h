@@ -451,6 +451,15 @@ struct ieee80211com {
     uint32_t ic_wcl_scan_away_time_ms;
     uint64_t ic_wcl_tx_packets[4];
     uint64_t ic_wcl_rx_packets[4];
+    /* EVLOG diagnostics: the firmware scan ("sweep") in progress. */
+    uint32_t ic_diag_sweep;
+    uint64_t ic_diag_sweep_start;       /* airport_up_time() ms, 0 = none */
+    uint32_t ic_diag_sweep_beacons;
+    uint32_t ic_diag_sweep_badchan;     /* ic_stats snapshots at sweep start */
+    uint32_t ic_diag_sweep_mismatch;
+    uint16_t ic_diag_sweep_nchan;
+    uint8_t ic_diag_sweep_join_chan;
+    uint16_t ic_diag_first[256];        /* first beacon per channel, ms after start + 1 */
 #endif
     /*
      * Set with a SCAN -> SCAN transition by a join request: the driver ends

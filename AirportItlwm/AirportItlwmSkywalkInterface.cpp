@@ -778,6 +778,7 @@ setASSOCIATE(struct apple80211_assoc_data *ad)
     struct apple80211_rsn_ie_data rsn_ie_data;
     struct apple80211_authtype_data auth_type_data;
     struct ieee80211com *ic = fHalService->get80211Controller();
+    EVLOG("setASSOCIATE (legacy) state=%d\n", ic->ic_state);
 
     if (!ad)
         return kIOReturnError;
@@ -819,6 +820,7 @@ setDISASSOCIATE(struct apple80211_disassoc_data *ad)
 {
     XYLog("%s\n", __FUNCTION__);
     struct ieee80211com *ic = fHalService->get80211Controller();
+    EVLOG("setDISASSOCIATE (legacy) state=%d\n", ic->ic_state);
 
     if (ic->ic_state < IEEE80211_S_SCAN)
         return kIOReturnSuccess;
@@ -965,6 +967,8 @@ setSCAN_REQ(struct apple80211_scan_data *sd)
           sd->ssid,
           ether_sprintf(sd->bssid.octet));
 #endif
+    EVLOG("legacy setSCAN_REQ type=%u nch=%u state=%d wrapping=%d\n",
+          sd->scan_type, sd->num_channels, ic->ic_state, fScanResultWrapping);
     if (fScanResultWrapping)
         return 22;
     if (ic->ic_state <= IEEE80211_S_INIT)

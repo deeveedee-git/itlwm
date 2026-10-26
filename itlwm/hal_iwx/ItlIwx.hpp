@@ -277,6 +277,7 @@ public:
     int    iwx_enable_txq(struct iwx_softc *, int, int, int, int);
     int     iwx_tvqm_alloc_txq(struct iwx_softc *, int, int);
     int     iwx_tvqm_enable_txq(struct iwx_softc *, int, int, uint32_t);
+    void    iwx_note_fw_err(struct iwx_softc *, const char *, int);
     int     iwx_scd_queue_cmd_ver(struct iwx_softc *);
     int     iwx_scd_queue_remove(struct iwx_softc *, int, int);
     int     iwx_scd_remove_sta_queues(struct iwx_softc *);
@@ -497,6 +498,9 @@ public:
     IOInterruptEventSource* fInterrupt;
     struct pci_attach_args pci;
     struct iwx_softc com;
+    // EVLOG diagnostics: firmware start after wake
+    uint64_t diagUpTime = 0;
+    uint32_t diagPrepMs = 0, diagNicMs = 0;
 };
 
 #endif

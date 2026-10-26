@@ -116,6 +116,21 @@ do\
 kprintf("%s: " fmt, "itlwm", ##x);\
 }while(0)
 
+/*
+ * EVLOG diagnostic build: important join/firmware events are also kept in a
+ * ring buffer and published on the PCI device as ioreg "ItlwmEventLog".
+ */
+#ifdef __cplusplus
+extern "C"
+#endif
+void itlwm_evlog(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+#define EVLOG(fmt, x...)\
+do\
+{\
+XYLog(fmt, ##x);\
+itlwm_evlog(fmt, ##x);\
+}while(0)
+
 typedef UInt8  u8;
 typedef UInt16 u16;
 typedef UInt32 u32;

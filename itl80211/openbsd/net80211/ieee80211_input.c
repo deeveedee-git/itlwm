@@ -2177,6 +2177,15 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, mbuf_t m,
     /* NB: must be after ni_chan is setup */
     ieee80211_setup_rates(ic, ni, rates, xrates, IEEE80211_F_DOSORT);
 #ifdef AIRPORT_WCL
+    /* EVLOG diagnostics: first beacon per channel in the current sweep. */
+    if (ic->ic_diag_sweep_start) {
+        unsigned dch = ieee80211_chan2ieee(ic, ni->ni_chan);
+        ic->ic_diag_sweep_beacons++;
+        if (dch < 256 && !ic->ic_diag_first[dch]) {
+            uint64_t d = airport_up_time() - ic->ic_diag_sweep_start;
+            ic->ic_diag_first[dch] = (uint16_t)(d < 65534 ? d + 1 : 65535);
+        }
+    }
     if (ic->ic_event_handler) {
         const uint8_t *ies = (const uint8_t *)&wh[1] + 12;
         const uint8_t *end = mtod(m, const uint8_t *) + mbuf_len(m);
@@ -2941,7 +2950,7 @@ ieee80211_recv_deauth(struct ieee80211com *ic, mbuf_t m,
     
     reason = LE_READ_2(frm);
 
-    XYLog("Deauth received, reason %d\n", reason);
+    EVLOG("AP sent Deauth, reason %d, state %d\n", reason, ic->ic_state);
     ic->ic_deauth_reason = reason;
     if (ic->ic_event_handler) {
         (*ic->ic_event_handler)(ic, IEEE80211_EVT_STA_DEAUTH, NULL);
@@ -3007,7 +3016,7 @@ ieee80211_recv_disassoc(struct ieee80211com *ic, mbuf_t m,
     
     reason = LE_READ_2(frm);
     
-    XYLog("Disassoc received, reason %d\n", reason);
+    EVLOG("AP sent Disassoc, reason %d, state %d\n", reason, ic->ic_state);
     
     ic->ic_stats.is_rx_disassoc++;
     switch (ic->ic_opmode) {

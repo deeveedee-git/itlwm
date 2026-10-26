@@ -1334,6 +1334,9 @@ ieee80211_node_choose_bss(struct ieee80211com *ic, int bgscan,
     for (; ni != NULL; ni = nextbs) {
         nextbs = RB_NEXT(ieee80211_tree, &ic->ic_tree, ni);
         if (ni->ni_fails) {
+            if (ic->ic_join_chan_scanned && !bgscan)
+                EVLOG("join scan: node ch %u rssi %d skipped, ni_fails=%u\n",
+                      ieee80211_chan2ieee(ic, ni->ni_chan), ni->ni_rssi, ni->ni_fails);
             /*
              * The configuration of the access points may change
              * during my scan.  So delete the entry for the AP
@@ -1349,6 +1352,15 @@ ieee80211_node_choose_bss(struct ieee80211com *ic, int bgscan,
             *curbs = ni;
         
         int fail = ieee80211_match_bss(ic, ni, bgscan);
+        /* EVLOG: why a one-channel join scan did or didn't pick a node (no names). */
+        if (ic->ic_join_chan_scanned && !bgscan)
+            EVLOG("join scan: node ch %u rssi %d esslen %u fail 0x%x%s%s%s%s\n",
+                  ieee80211_chan2ieee(ic, ni->ni_chan), ni->ni_rssi, ni->ni_esslen, fail,
+                  (fail & IEEE80211_NODE_ASSOCFAIL_ESSID) ? " essid" : "",
+                  (fail & IEEE80211_NODE_ASSOCFAIL_BSSID) ? " bssid" : "",
+                  (fail & IEEE80211_NODE_ASSOCFAIL_WPA_PROTO) ? " rsn" : "",
+                  (fail & (IEEE80211_NODE_ASSOCFAIL_CHAN | IEEE80211_NODE_ASSOCFAIL_IBSS |
+                           IEEE80211_NODE_ASSOCFAIL_PRIVACY | IEEE80211_NODE_ASSOCFAIL_BASIC_RATE)) ? " other" : "");
         if (fail != 0) {
             DPRINTF(("%s ieee80211_match_bss==FALSE, ssid=%s, bssid=%s, %d\n", __FUNCTION__, ni->ni_essid, ether_sprintf(ni->ni_bssid), fail));
             continue;
@@ -1576,7 +1588,10 @@ ieee80211_end_scan(struct _ifnet *ifp)
         if (ic->ic_join_chan_scanned && ic->ic_join_chan_retries < 1) {
             ic->ic_join_chan_retries++;
             ic->ic_join_chan = ic->ic_join_chan_scanned;
-        }
+            EVLOG("join scan: BSS not found on ch %u, scanning it again\n", ic->ic_join_chan);
+        } else if (ic->ic_join_chan_scanned)
+            EVLOG("join scan: BSS not found on ch %u, scanning all channels\n",
+                  ic->ic_join_chan_scanned);
         goto notfound;
     }
     ic->ic_join_chan_scanned = 0;
@@ -2142,8 +2157,8 @@ void
 ieee80211_free_allnodes(struct ieee80211com *ic, int clear_ic_bss)
 {
     struct ieee80211_node *ni, *next_ni;
-    int s;
-    
+    int s, freed = 0;
+
     DPRINTF(("freeing all nodes\n"));
     s = splnet();
     for (ni = RB_MIN(ieee80211_tree, &ic->ic_tree);
@@ -2156,9 +2171,11 @@ ieee80211_free_allnodes(struct ieee80211com *ic, int clear_ic_bss)
             }
         }
         ieee80211_free_node(ic, ni);
+        freed++;
     }
     splx(s);
-    
+    EVLOG("node table flushed: %d freed, keep_bss=%d, state=%d\n", freed, !clear_ic_bss, ic->ic_state);
+
     if (clear_ic_bss && ic->ic_bss != NULL)
         ieee80211_node_cleanup(ic, ic->ic_bss);
 }

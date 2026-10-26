@@ -124,6 +124,170 @@
 #include <sys/pcireg.h>
 #include <net80211/ieee80211_priv.h>
 
+/*
+ * EVLOG diagnostic build: a ring of the last ITLWM_EVLOG_N important events
+ * with wall-clock time, published as the PCI device property "ItlwmEventLog"
+ * (ioreg -lw0 | grep ItlwmEventLog, or itlwm-log.sh). Events are rare (joins,
+ * state changes, firmware errors, scans), so republishing on each one is cheap.
+ */
+#define ITLWM_EVLOG_N    400
+#define ITLWM_EVLOG_LEN  200
+static IOSimpleLock *itlwm_evlog_lock;
+static IOService *itlwm_evlog_target;
+static char itlwm_evlog_ring[ITLWM_EVLOG_N][ITLWM_EVLOG_LEN];
+static uint32_t itlwm_evlog_next, itlwm_evlog_count;
+
+static void
+itlwm_evlog_init(IOService *target)
+{
+    if (!itlwm_evlog_lock)
+        itlwm_evlog_lock = IOSimpleLockAlloc();
+    itlwm_evlog_target = target;
+}
+
+extern "C" void
+itlwm_evlog(const char *fmt, ...)
+{
+    char line[ITLWM_EVLOG_LEN];
+    clock_sec_t sec;
+    clock_usec_t usec;
+    va_list ap;
+    int n;
+
+    if (!itlwm_evlog_lock || !itlwm_evlog_target)
+        return;
+    clock_get_calendar_microtime(&sec, &usec);
+    n = snprintf(line, sizeof(line), "%lu.%03u ", (unsigned long)sec, (unsigned)(usec / 1000));
+    va_start(ap, fmt);
+    vsnprintf(line + n, sizeof(line) - n, fmt, ap);
+    va_end(ap);
+    n = (int)strlen(line);
+    while (n > 0 && line[n - 1] == '\n')
+        line[--n] = '\0';
+
+    OSArray *log = OSArray::withCapacity(ITLWM_EVLOG_N);
+    if (!log)
+        return;
+    char (*snap)[ITLWM_EVLOG_LEN] = (char (*)[ITLWM_EVLOG_LEN])IOMalloc(sizeof(itlwm_evlog_ring));
+    if (!snap) {
+        log->release();
+        return;
+    }
+    IOSimpleLockLock(itlwm_evlog_lock);
+    strlcpy(itlwm_evlog_ring[itlwm_evlog_next], line, ITLWM_EVLOG_LEN);
+    itlwm_evlog_next = (itlwm_evlog_next + 1) % ITLWM_EVLOG_N;
+    if (itlwm_evlog_count < ITLWM_EVLOG_N)
+        itlwm_evlog_count++;
+    uint32_t count = itlwm_evlog_count;
+    uint32_t first = (itlwm_evlog_next + ITLWM_EVLOG_N - count) % ITLWM_EVLOG_N;
+    for (uint32_t i = 0; i < count; i++)
+        memcpy(snap[i], itlwm_evlog_ring[(first + i) % ITLWM_EVLOG_N], ITLWM_EVLOG_LEN);
+    IOSimpleLockUnlock(itlwm_evlog_lock);
+
+    for (uint32_t i = 0; i < count; i++) {
+        OSString *str = OSString::withCString(snap[i]);
+        if (str) {
+            log->setObject(str);
+            str->release();
+        }
+    }
+    IOFree(snap, sizeof(itlwm_evlog_ring));
+    itlwm_evlog_target->setProperty("ItlwmEventLog", log);
+    log->release();
+}
+
+#ifdef AIRPORT_WCL
+/*
+ * EVLOG scan diagnostics: one firmware scan ("sweep") from start to end, with
+ * the time of the first beacon on each channel (ieee80211_recv_probe_resp).
+ */
+static void
+itlwm_diag_sweep_end(struct ieee80211com *ic, const char *how)
+{
+    struct ieee80211_node *ni;
+    unsigned nodes = 0, nodes5 = 0, ch;
+    char buf[160];
+    size_t n = 0;
+    bool any = false;
+
+    if (!ic->ic_diag_sweep_start)
+        return;
+    RB_FOREACH(ni, ieee80211_tree, &ic->ic_tree) {
+        nodes++;
+        if (ni->ni_chan && ni->ni_chan != IEEE80211_CHAN_ANYC &&
+            IEEE80211_IS_CHAN_5GHZ(ni->ni_chan))
+            nodes5++;
+    }
+    EVLOG("sweep #%u %s after %llums: %u beacons, dropped badchan=%u mismatch=%u, nodes=%u (5G %u)\n",
+          ic->ic_diag_sweep, how,
+          (unsigned long long)(airport_up_time() - ic->ic_diag_sweep_start),
+          ic->ic_diag_sweep_beacons,
+          ic->ic_stats.is_rx_badchan - ic->ic_diag_sweep_badchan,
+          ic->ic_stats.is_rx_chanmismatch - ic->ic_diag_sweep_mismatch,
+          nodes, nodes5);
+    buf[0] = '\0';
+    for (ch = 1; ch < 256; ch++) {
+        if (!ic->ic_diag_first[ch])
+            continue;
+        any = true;
+        n += snprintf(buf + n, sizeof(buf) - n, " %u@%u", ch, ic->ic_diag_first[ch] - 1);
+        if (n >= sizeof(buf) - 16) {
+            EVLOG("sweep #%u first beacon ch@ms:%s\n", ic->ic_diag_sweep, buf);
+            n = 0;
+            buf[0] = '\0';
+        }
+    }
+    if (n || !any)
+        EVLOG("sweep #%u first beacon ch@ms:%s\n", ic->ic_diag_sweep, any ? buf : " none");
+    ic->ic_diag_sweep_start = 0;
+}
+
+static void
+itlwm_diag_sweep_start(struct ieee80211com *ic, int bgscan)
+{
+    unsigned a2 = 0, a5 = 0, ch;
+
+    itlwm_diag_sweep_end(ic, "replaced");
+    for (ch = 1; ch <= IEEE80211_CHAN_MAX; ch++) {
+        if (!ic->ic_channels[ch].ic_flags || isclr(ic->ic_chan_active, ch))
+            continue;
+        if (IEEE80211_IS_CHAN_2GHZ(&ic->ic_channels[ch]))
+            a2++;
+        else
+            a5++;
+    }
+    ic->ic_diag_sweep++;
+    EVLOG("sweep #%u start %s state=%d mode=%u active=2G:%u/5G:%u nch=%u join_ch=%u wcl_req=%d restricted=%d probes=%d\n",
+          ic->ic_diag_sweep, bgscan ? "bg" : "fg", ic->ic_state, ic->ic_curmode,
+          a2, a5, ic->ic_diag_sweep_nchan, ic->ic_diag_sweep_join_chan,
+          ic->ic_wcl_scan_requested, ic->ic_wcl_scan_restricted,
+          AirportWCL::scanUsesProbes(ic->ic_wcl_scan_requested, ic->ic_wcl_scan_active));
+    ic->ic_diag_sweep_beacons = 0;
+    ic->ic_diag_sweep_badchan = ic->ic_stats.is_rx_badchan;
+    ic->ic_diag_sweep_mismatch = ic->ic_stats.is_rx_chanmismatch;
+    memset(ic->ic_diag_first, 0, sizeof(ic->ic_diag_first));
+    ic->ic_diag_sweep_start = airport_up_time();
+    if (!ic->ic_diag_sweep_start)
+        ic->ic_diag_sweep_start = 1;
+}
+#endif
+
+/* EVLOG diagnostics: PCI power state and link, for firmware start after wake. */
+static void
+itlwm_diag_hwstate(struct iwx_softc *sc, char *buf, size_t len)
+{
+    int pm = 0;
+    pcireg_t pmcsr = 0xffff, lcsr, cmd;
+
+    if (pci_get_capability(sc->sc_pct, sc->sc_pcitag, PCI_CAP_PWRMGMT, &pm, NULL))
+        pmcsr = pci_conf_read(sc->sc_pct, sc->sc_pcitag, pm + PCI_PMCSR);
+    lcsr = pci_conf_read(sc->sc_pct, sc->sc_pcitag, sc->sc_cap_off + PCI_PCIE_LCSR);
+    cmd = pci_conf_read(sc->sc_pct, sc->sc_pcitag, PCI_COMMAND_STATUS_REG);
+    snprintf(buf, len, "D%u lcsr 0x%x cmd 0x%x GP_CNTRL 0x%x RESET 0x%x HW_IF_CONFIG 0x%x",
+             pmcsr & PCI_PMCSR_STATE_MASK, lcsr, cmd, IWX_READ(sc, IWX_CSR_GP_CNTRL),
+             IWX_READ(sc, IWX_CSR_RESET), IWX_READ(sc, IWX_CSR_HW_IF_CONFIG_REG));
+}
+
 #define super ItlHalService
 OSDefineMetaClassAndStructors(ItlIwx, ItlHalService)
 
@@ -266,6 +430,12 @@ IOReturn ItlIwx::enable(IONetworkInterface *netif)
         return kIOReturnSuccess;
     }
     ifp->if_flags |= IFF_UP;
+    {
+        char hw[160];
+        itlwm_diag_hwstate(&com, hw, sizeof(hw));
+        EVLOG("interface up: %s\n", hw);
+        diagUpTime = airport_up_time();
+    }
     iwx_activate(&com, DVACT_RESUME);
     iwx_activate(&com, DVACT_WAKEUP);
     return kIOReturnSuccess;
@@ -281,6 +451,11 @@ IOReturn ItlIwx::disable(IONetworkInterface *netif)
     }
     ifp->if_flags &= ~IFF_UP;
     iwx_activate(&com, DVACT_QUIESCE);
+    {
+        char hw[160];
+        itlwm_diag_hwstate(&com, hw, sizeof(hw));
+        EVLOG("interface down (card stopped): %s\n", hw);
+    }
     return kIOReturnSuccess;
 }
 
@@ -3686,6 +3861,8 @@ iwx_tvqm_enable_txq(struct iwx_softc *sc, int tid, int ssn, uint32_t size)
     wr_idx = le16toh(resp->write_pointer);
     if (scd_ver == 3)
         sc->sc_scd_tid_mask |= 1 << tid;
+    XYLog("%s: tid %d size %u -> fw qid %d wr_idx %u (scd ver %d)\n",
+          __FUNCTION__, tid, size, fwqid, wr_idx, scd_ver);
     if (fwqid >= ARRAY_SIZE(sc->txq)) {
         XYLog("queue index %d unsupported", fwqid);
         err = -EIO;
@@ -3713,6 +3890,9 @@ fail:
      * Release a queue the firmware added but we could not accept
      * (not when the device went away while the command was in flight).
      */
+    XYLog("%s: tid %d size %u failed, err %d\n", __FUNCTION__, tid, size, err);
+    if (scd_ver == 3 && err != -ENXIO)
+        iwx_note_fw_err(sc, "agg-queue-add", err);
     if (scd_ver == 3 && err != -ENXIO && (sc->sc_scd_tid_mask & (1 << tid))) {
         iwx_scd_queue_remove(sc, IWX_STATION_ID, tid);
         sc->sc_scd_tid_mask &= ~(1 << tid);
@@ -3730,6 +3910,21 @@ fail:
     delete ring;
 #endif
     return err;
+}
+
+/*
+ * XYLog output does not reach the unified log, so failures of the commands
+ * that changed with firmware API -77 are published on the PCI device as
+ * "ItlwmFwLastErr" (ioreg -lw0 | grep ItlwmFw).
+ */
+void ItlIwx::
+iwx_note_fw_err(struct iwx_softc *sc, const char *what, int err)
+{
+    char buf[64];
+
+    XYLog("%s: %s failed, err %d\n", DEVNAME(sc), what, err);
+    snprintf(buf, sizeof(buf), "%s err=%d", what, err);
+    sc->sc_pcitag->setProperty("ItlwmFwLastErr", buf);
 }
 
 /*
@@ -3757,9 +3952,11 @@ iwx_scd_queue_remove(struct iwx_softc *sc, int sta_id, int tid)
     cmd.u.remove.tid = htole32(tid);
     err = iwx_send_cmd_pdu(sc, IWX_WIDE_ID(IWX_DATA_PATH_GROUP,
                            IWX_SCD_QUEUE_CONFIG_CMD), 0, sizeof(cmd), &cmd);
-    if (err)
+    if (err) {
         XYLog("%s: could not remove Tx queue of sta %d tid %d (error %d)\n",
               DEVNAME(sc), sta_id, tid, err);
+        iwx_note_fw_err(sc, "scd-queue-remove", err);
+    }
     return err;
 }
 
@@ -4414,6 +4611,8 @@ iwx_sta_rx_agg_baid_cfg_cmd(struct iwx_softc *sc, uint8_t tid, uint16_t ssn,
                                   IWX_RX_BAID_ALLOCATION_CONFIG_CMD), sizeof(cmd), &cmd, &new_baid);
     if (err)
         return err;
+    XYLog("%s: %s tid %d ssn %d win %d -> baid %u\n", __FUNCTION__,
+          start ? "add" : "remove", tid, ssn, winsize, new_baid);
     if (start) {
         if (new_baid >= nitems(sc->sc_rxba_data))
             return ERANGE;
@@ -4451,6 +4650,7 @@ iwx_sta_rx_agg(struct iwx_softc *sc, struct ieee80211_node *ni, uint8_t tid,
             return ENXIO;
         }
         if (err) {
+            iwx_note_fw_err(sc, start ? "rx-baid-add" : "rx-baid-remove", err);
             if (start)
                 ieee80211_addba_req_refuse(ic, ni, tid);
             splx(s);
@@ -5061,29 +5261,40 @@ iwx_load_firmware(struct iwx_softc *sc)
         return err;
     }
     
+    uint64_t waitStart = airport_up_time();
     err = iwx_wait_notification(sc, &sc->sc_uc.uc_intr, 1,
                                 sc->sc_alive_timeout ? sc->sc_alive_timeout : 1000);
+    uint32_t waitMs = (uint32_t)(airport_up_time() - waitStart);
     if (err == ENXIO)
         return err;
     if (!err && !sc->sc_uc.uc_ok)
         err = EIO;
+    if (!err)
+        EVLOG("fw alive after %ums (prepare_card_hw %ums, nic_init %ums)\n",
+              waitMs, diagPrepMs, diagNicMs);
     if (err || !sc->sc_uc.uc_ok) {
 #ifdef AIRPORT_VTD
         sc->sc_dmat->deferRecycling();
 #endif
         if (iwx_nic_lock(sc)) {
-            XYLog("SecBoot CPU1 Status: 0x%x, CPU2 Status: 0x%x\n",
-                  iwx_read_umac_prph(sc, IWX_UMAG_SB_CPU_1_STATUS),
-                  iwx_read_umac_prph(sc, IWX_UMAG_SB_CPU_2_STATUS));
-            XYLog("UMAC PC: 0x%x\n",
-                  iwx_read_umac_prph(sc,
-                                     IWX_UREG_UMAC_CURRENT_PC));
-            XYLog("LMAC PC: 0x%x\n",
-                  iwx_read_umac_prph(sc,
-                                     IWX_UREG_LMAC1_CURRENT_PC));
+            uint32_t sb1 = iwx_read_umac_prph(sc, IWX_UMAG_SB_CPU_1_STATUS);
+            uint32_t sb2 = iwx_read_umac_prph(sc, IWX_UMAG_SB_CPU_2_STATUS);
+            uint32_t umac = iwx_read_umac_prph(sc, IWX_UREG_UMAC_CURRENT_PC);
+            uint32_t lmac = iwx_read_umac_prph(sc, IWX_UREG_LMAC1_CURRENT_PC);
             iwx_nic_unlock(sc);
-        }
+            XYLog("SecBoot CPU1 Status: 0x%x, CPU2 Status: 0x%x\n", sb1, sb2);
+            XYLog("UMAC PC: 0x%x\n", umac);
+            XYLog("LMAC PC: 0x%x\n", lmac);
+            EVLOG("fw load fail detail: waited %ums, prepare_card_hw %ums, nic_init %ums, SecBoot 0x%x/0x%x, UMAC PC 0x%x, LMAC PC 0x%x\n",
+                  waitMs, diagPrepMs, diagNicMs, sb1, sb2, umac, lmac);
+        } else
+            EVLOG("fw load fail detail: waited %ums, prepare_card_hw %ums, nic_init %ums, NIC lock failed\n",
+                  waitMs, diagPrepMs, diagNicMs);
         iwx_ctxt_info_free_paging(sc);
+        EVLOG("fw load fail: err %d uc_ok %d CSR_INT 0x%x FH_INT 0x%x GP_CNTRL 0x%x RESET 0x%x HW_IF_CONFIG 0x%x\n",
+              err, sc->sc_uc.uc_ok, IWX_READ(sc, IWX_CSR_INT),
+              IWX_READ(sc, IWX_CSR_FH_INT_STATUS), IWX_READ(sc, IWX_CSR_GP_CNTRL),
+              IWX_READ(sc, IWX_CSR_RESET), IWX_READ(sc, IWX_CSR_HW_IF_CONFIG_REG));
         XYLog("%s: could not load firmware\n", DEVNAME(sc));
     }
     
@@ -5105,9 +5316,12 @@ iwx_start_fw(struct iwx_softc *sc)
     
     XYLog("%s\n", __FUNCTION__);
     int err;
+    uint64_t t0 = airport_up_time();
     
     err = iwx_prepare_card_hw(sc);
+    diagPrepMs = (uint32_t)(airport_up_time() - t0);
     if (err) {
+        EVLOG("fw start: prepare_card_hw failed (%d) after %ums\n", err, diagPrepMs);
         XYLog("%s: could not initialize hardware\n", DEVNAME(sc));
         return err;
     }
@@ -5126,8 +5340,11 @@ iwx_start_fw(struct iwx_softc *sc)
     /* clear (again), then enable firwmare load interrupt */
     IWX_WRITE(sc, IWX_CSR_INT, ~0);
     
+    t0 = airport_up_time();
     err = iwx_nic_init(sc);
+    diagNicMs = (uint32_t)(airport_up_time() - t0);
     if (err) {
+        EVLOG("fw start: nic_init failed (%d) after %ums\n", err, diagNicMs);
         XYLog("%s: unable to init nic\n", DEVNAME(sc));
         return err;
     }
@@ -6571,9 +6788,16 @@ iwx_phy_ctxt_cmd_v3(struct iwx_softc *sc, struct iwx_phy_ctxt *ctxt,
                                     IWX_PHY_RX_CHAIN_MIMO_CNT_POS);
     }
     err = iwx_send_cmd_pdu(sc, IWX_PHY_CONTEXT_CMD, 0, sizeof(cmd), &cmd);
+    if (err && cmdver >= 4)
+        iwx_note_fw_err(sc, "phy-ctxt-v4", err);
     if (err || cmdver < 4 || action == IWX_FW_CTXT_ACTION_REMOVE)
         return err;
-    return iwx_phy_send_rlc(sc, ctxt, idle_cnt, active_cnt);
+    err = iwx_phy_send_rlc(sc, ctxt, idle_cnt, active_cnt);
+    XYLog("%s: RLC phy %d rx_ant 0x%x idle %d active %d err %d\n", __FUNCTION__,
+          ctxt->id, iwx_fw_valid_rx_ant(sc), idle_cnt, active_cnt, err);
+    if (err)
+        iwx_note_fw_err(sc, "rlc-config", err);
+    return err;
 }
 
 int ItlIwx::
@@ -6887,6 +7111,15 @@ iwx_send_cmd(struct iwx_softc *sc, struct iwx_host_cmd *hcmd)
             if (result != THREAD_AWAKENED) {
                 if (txdata->flags & IWX_TXDATA_FLAG_CMD_PENDING)
                     err = (result == THREAD_TIMED_OUT) ? EWOULDBLOCK : EINTR;
+                if (err == EWOULDBLOCK) {
+                    static int dumps;
+                    EVLOG("cmd timeout: id 0x%x (grp 0x%x) CSR_INT 0x%x FH_INT 0x%x GP_CNTRL 0x%x\n",
+                          code, group_id, IWX_READ(sc, IWX_CSR_INT),
+                          IWX_READ(sc, IWX_CSR_FH_INT_STATUS),
+                          IWX_READ(sc, IWX_CSR_GP_CNTRL));
+                    if (dumps++ < 3)
+                        iwx_nic_error(sc);
+                }
                 break;
             }
         }
@@ -7940,7 +8173,11 @@ iwx_umac_scan_fill_channels(struct iwx_softc *sc,
     }
     if (!bgscan)
         ic->ic_join_chan_scanned = join_chan;
-    
+#ifdef AIRPORT_WCL
+    ic->ic_diag_sweep_nchan = nchan;
+    ic->ic_diag_sweep_join_chan = join_chan;
+#endif
+
     return nchan;
 }
 
@@ -8634,6 +8871,10 @@ iwx_umac_scan_v14(struct iwx_softc *sc, int bgscan)
         isset(sc->sc_ucode_api, IWX_UCODE_TLV_API_FRAGMENTED_SCAN));
     const uint32_t timeout = htole32(timing.suspendTU);
     const uint32_t maxOut = htole32(timing.maxOutTU);
+    if (bgscan)
+        EVLOG("bg scan timing: away=%ums max_out=%uTU suspend=%uTU fragmented=%d frag_api=%d\n",
+              ic->ic_wcl_scan_away_time_ms, timing.maxOutTU, le32toh(timeout), timing.fragmented,
+              !!isset(sc->sc_ucode_api, IWX_UCODE_TLV_API_FRAGMENTED_SCAN));
 #else
     const uint32_t timeout = bgscan ?  htole32(120) : htole32(0);
     const uint32_t maxOut = timeout;
@@ -8644,7 +8885,7 @@ iwx_umac_scan_v14(struct iwx_softc *sc, int bgscan)
         .data = { NULL, },
         .flags = 0,
     };
-    
+
     req_len = iwx_umac_scan_size(sc);
     req = (struct iwx_scan_req_umac_v14 *)malloc(req_len, 0,
                                              (async ? M_NOWAIT : M_WAITOK) | M_ZERO);
@@ -9207,9 +9448,13 @@ iwx_scan(struct iwx_softc *sc)
     err = iwx_umac_scan(sc, 0);
     if (err) {
         XYLog("%s: could not initiate scan\n", DEVNAME(sc));
+        EVLOG("fw scan start failed, error %d\n", err);
         return err;
     }
-    
+#ifdef AIRPORT_WCL
+    itlwm_diag_sweep_start(ic, 0);
+#endif
+
     /*
      * The current mode might have been fixed during association.
      * Ensure all channels get scanned.
@@ -9246,9 +9491,13 @@ iwx_bgscan(struct ieee80211com *ic)
     err = that->iwx_umac_scan(sc, 1);
     if (err) {
         XYLog("%s: could not initiate scan\n", DEVNAME(sc));
+        EVLOG("fw bg scan start failed, error %d\n", err);
         return err;
     }
-    
+#ifdef AIRPORT_WCL
+    itlwm_diag_sweep_start(ic, 1);
+#endif
+
     sc->sc_flags |= IWX_FLAG_BGSCAN;
     return 0;
 }
@@ -9276,6 +9525,12 @@ iwx_scan_abort(struct iwx_softc *sc)
         sc->sc_flags &= ~(IWX_FLAG_SCANNING | IWX_FLAG_BGSCAN);
     else
         sc->sc_scan_abort_pending = false;
+#ifdef AIRPORT_WCL
+    if (err == 0)
+        itlwm_diag_sweep_end(&sc->sc_ic, "aborted");
+    else
+        EVLOG("fw scan abort failed, error %d\n", err);
+#endif
     return err;
 }
 
@@ -9291,6 +9546,14 @@ iwx_enable_mgmt_queue(struct iwx_softc *sc)
     else
         sc->first_data_qid = IWX_QID_MGMT;
 
+    char api[96];
+    snprintf(api, sizeof(api), "scd-queue=%d phy-ctxt=%d scan=%d tlc=%d baid-cmd=%d",
+             iwx_scd_queue_cmd_ver(sc),
+             iwx_lookup_cmd_ver(sc, IWX_LONG_GROUP, IWX_PHY_CONTEXT_CMD),
+             iwx_lookup_cmd_ver(sc, IWX_LONG_GROUP, IWX_SCAN_REQ_UMAC),
+             iwx_lookup_cmd_ver(sc, IWX_DATA_PATH_GROUP, IWX_TLC_MNG_CONFIG_CMD),
+             isset(sc->sc_enabled_capa, IWX_UCODE_TLV_CAPA_BAID_ML_SUPPORT) ? 1 : 0);
+    sc->sc_pcitag->setProperty("ItlwmFwApi", api);
 
     err = iwx_enable_txq(sc, IWX_STATION_ID,
                          sc->first_data_qid, IWX_MGMT_TID,
@@ -9298,6 +9561,7 @@ iwx_enable_mgmt_queue(struct iwx_softc *sc)
     if (err) {
         XYLog("%s: could not enable MGMT Tx queue %d (error %d)\n",
               DEVNAME(sc), sc->first_data_qid, err);
+        iwx_note_fw_err(sc, "mgmt-queue", err);
         return err;
     }
     
@@ -10410,6 +10674,9 @@ iwx_newstate_task(void *psc)
     int generation = sc->sc_generation;
     int arg = sc->ns_arg;
     int err = 0, s = splnet();
+    if (ostate != nstate)    /* SCAN -> SCAN repeats every scan */
+        EVLOG("state %s -> %s\n", ieee80211_state_name[ostate],
+              ieee80211_state_name[nstate]);
     
     XYLog("%s sc->sc_flags & IWX_FLAG_SHUTDOWN %s\n", __FUNCTION__, sc->sc_flags & IWX_FLAG_SHUTDOWN ? "true" : "false");
     if (sc->sc_flags & IWX_FLAG_SHUTDOWN) {
@@ -10452,9 +10719,11 @@ iwx_newstate_task(void *psc)
                 if (!(sc->sc_flags & IWX_FLAG_SCANNING) ||
                     that->iwx_scan_abort(sc) == 0) {
                     ic->ic_scan_restart = false;
+                    EVLOG("scan restarted for system request\n");
                     goto next_scan;
                 }
                 ic->ic_scan_restart = false;
+                EVLOG("scan restart: abort failed, request rides the scan in progress\n");
             }
             if (sc->sc_flags & IWX_FLAG_SCANNING) {
                 //                refcnt_rele_wake(&sc->task_refs);
@@ -10591,8 +10860,11 @@ iwx_endscan(struct iwx_softc *sc)
     
     if ((sc->sc_flags & (IWX_FLAG_SCANNING | IWX_FLAG_BGSCAN)) == 0)
         return;
-    
+
     sc->sc_flags &= ~(IWX_FLAG_SCANNING | IWX_FLAG_BGSCAN);
+#ifdef AIRPORT_WCL
+    itlwm_diag_sweep_end(ic, "done");
+#endif
     ieee80211_end_scan(&ic->ic_if);
 }
 
@@ -11057,6 +11329,7 @@ iwx_init(struct _ifnet *ifp)
     if (ic->ic_event_handler)
         ic->ic_event_handler(ic, IEEE80211_EVT_DRIVER_RESET_BEGIN, NULL);
 #endif
+    EVLOG("firmware start\n");
     for (int attempt = 0; ; attempt++) {
         /*
          * After some wakes from S0ix the first firmware load never reports
@@ -11066,6 +11339,13 @@ iwx_init(struct _ifnet *ifp)
          * attempt instead of 1 s, and the full time on the retry.
          */
         sc->sc_alive_timeout = attempt == 0 ? 300 : 1000;
+        {
+            char hw[160];
+            itlwm_diag_hwstate(sc, hw, sizeof(hw));
+            EVLOG("fw start attempt %d (alive timeout %ums), %llums after interface up: %s\n", attempt,
+                  sc->sc_alive_timeout,
+                  (unsigned long long)(diagUpTime ? airport_up_time() - diagUpTime : 0), hw);
+        }
         err = iwx_init_hw(sc);
         sc->sc_alive_timeout = 0;
         if (generation != sc->sc_generation)
@@ -11077,7 +11357,7 @@ iwx_init(struct _ifnet *ifp)
         if (attempt != 0 || err == ENXIO || !(ifp->if_flags & IFF_UP) ||
             (sc->sc_flags & (IWX_FLAG_RFKILL | IWX_FLAG_HW_ERR)))
             return err;
-        XYLog("%s: retrying firmware initialization after error %d\n", DEVNAME(sc), err);
+        EVLOG("retrying firmware initialization after error %d\n", err);
     }
     
     if (sc->sc_nvm.sku_cap_11n_enable)
@@ -11263,6 +11543,7 @@ iwx_stop(struct _ifnet *ifp)
     ifp->if_flags &= ~IFF_RUNNING;
 #ifdef AIRPORT_WCL
     // A stopped firmware scan cannot deliver its completion event.
+    itlwm_diag_sweep_end(ic, "stopped");
     sc->sc_scan_abort_pending = false;
     ic->ic_scan_restart = false;
     ic->ic_flags &= ~(IEEE80211_F_BGSCAN | IEEE80211_F_ASCAN);
@@ -11526,6 +11807,8 @@ iwx_nic_umac_error(struct iwx_softc *sc)
     XYLog("%s: 0x%08X | stack pointer\n", DEVNAME(sc),
           table.stack_pointer);
     XYLog("%s: 0x%08X | last host cmd\n", DEVNAME(sc), table.cmd_header);
+    EVLOG("FIRMWARE CRASH (UMAC) %s 0x%08X, last host cmd 0x%08X\n",
+          iwx_desc_lookup(table.error_id), table.error_id, table.cmd_header);
     XYLog("%s: 0x%08X | isr status reg\n", DEVNAME(sc),
           table.nic_isr_pref);
 }
@@ -11610,6 +11893,7 @@ iwx_nic_error(struct iwx_softc *sc)
     
     XYLog("%s: 0x%08X | %-28s\n", DEVNAME(sc), table.error_id,
           iwx_desc_lookup(table.error_id));
+    EVLOG("FIRMWARE CRASH (LMAC) %s 0x%08X\n", iwx_desc_lookup(table.error_id), table.error_id);
     XYLog("%s: %08X | trm_hw_status0\n", DEVNAME(sc),
           table.trm_hw_status0);
     XYLog("%s: %08X | trm_hw_status1\n", DEVNAME(sc),
@@ -11967,19 +12251,23 @@ iwx_rx_pkt(struct iwx_softc *sc, struct iwx_rx_data *data, struct mbuf_list *ml)
                 SYNC_RESP_STRUCT(notif, pkt, struct iwx_umac_scan_complete *);
                 /* The end of an aborted scan, not of the one that followed. */
                 if (sc->sc_scan_abort_pending &&
-                    notif->status == IWX_SCAN_OFFLOAD_ABORTED)
+                    notif->status == IWX_SCAN_OFFLOAD_ABORTED) {
+                    EVLOG("fw scan complete of aborted scan ignored\n");
                     break;
+                }
                 sc->sc_scan_abort_pending = false;
                 iwx_endscan(sc);
                 break;
             }
-                
+
             case IWX_SCAN_ITERATION_COMPLETE_UMAC: {
                 struct iwx_umac_scan_iter_complete_notif *notif;
                 SYNC_RESP_STRUCT(notif, pkt, struct iwx_umac_scan_iter_complete_notif *);
                 if (sc->sc_scan_abort_pending &&
-                    notif->status == IWX_SCAN_OFFLOAD_ABORTED)
+                    notif->status == IWX_SCAN_OFFLOAD_ABORTED) {
+                    EVLOG("fw scan iteration of aborted scan ignored\n");
                     break;
+                }
                 sc->sc_scan_abort_pending = false;
                 iwx_endscan(sc);
                 break;
@@ -13729,6 +14017,8 @@ iwx_attach(struct iwx_softc *sc, struct pci_attach_args *pa)
     
     sc->sc_pct = pa->pa_pc;
     sc->sc_pcitag = pa->pa_tag;
+    itlwm_evlog_init(sc->sc_pcitag);
+    EVLOG("driver attach\n");
     sc->sc_dmat = pa->pa_dmat;
     
     //    rw_init(&sc->ioctl_rwl, "iwxioctl");
@@ -14183,12 +14473,16 @@ iwx_activate(struct iwx_softc *sc, int act)
             /* Also cancel a firmware load that has not reached IFF_RUNNING. */
             iwx_stop(ifp);
             break;
-        case DVACT_RESUME:
+        case DVACT_RESUME: {
+            uint64_t t0 = airport_up_time();
             err = iwx_resume(sc);
+            EVLOG("resume: prepare_card_hw %s after %llums\n", err ? "FAILED" : "ok",
+                  (unsigned long long)(airport_up_time() - t0));
             if (err)
                 XYLog("%s: could not initialize hardware\n",
                       DEVNAME(sc));
             break;
+        }
         case DVACT_WAKEUP:
             /* Hardware should be up at this point. */
             if (iwx_set_hw_ready(sc))

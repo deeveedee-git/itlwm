@@ -50,7 +50,10 @@ public:
      * during association made IO80211 abandon the join (WCL_LEAVE_NETWORK);
      * accept them as no-ops.
      */
-    IOReturn setWCL_ARP_MODE(apple80211_wcl_arp_mode*) override { return kIOReturnSuccess; }
+    IOReturn setWCL_ARP_MODE(apple80211_wcl_arp_mode*) override {
+        EVLOG("setWCL_ARP_MODE accepted (no-op)\n");
+        return kIOReturnSuccess;
+    }
     IOReturn setWCL_QOS_PARAMS(apple80211_wcl_qos_params*) override { return kIOReturnUnsupported; }
     IOReturn setVOICE_IND_STATE(apple80211_voice_ind_state*) override { return kIOReturnUnsupported; }
     IOReturn setMWS_ACCESSORY_POWER_LIMIT_WIFI_ENH(apple80211_mws_accessory_power_limit*) override { return kIOReturnUnsupported; }
@@ -350,7 +353,10 @@ public:
     virtual IOReturn setABORT_SCAN(apple80211_abort_scan *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn setSET_PROPERTY(apple80211_set_property_unserialized_data *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn setROAM_CACHE_UPDATE(apple80211_roam_cache_data *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
-    virtual IOReturn setPM_MODE(apple80211_pm_mode *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnSuccess; }
+    virtual IOReturn setPM_MODE(apple80211_pm_mode *) AIRPORT_SKYWALK_OVERRIDE {
+        EVLOG("setPM_MODE accepted (no-op)\n");
+        return kIOReturnSuccess;
+    }
     virtual IOReturn setSET_WIFI_ASSERTION_STATE(apple80211_wifi_assertion_data *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn setREASSOCIATE_WITH_CORECAPTURE(apple80211_capture_debug_info_t *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn setLINKDOWN_DEBOUNCE_STATUS(apple80211_linkdown_debounce_status *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
@@ -460,6 +466,14 @@ private:
     // A scan request held while the firmware restarts (resumeWCLScan).
     bool scanDeferred = false;
     AirportWCL::ScanRequest deferredScan = {};
+    // EVLOG diagnostics for the WCL scan request in progress
+    uint32_t diagScanId;
+    uint64_t diagScanStart;
+    uint32_t diagScanResults;
+    uint32_t diagScanResultsInRequest;
+    bool diagScanRestricted;
+    uint8_t diagScanChannels[32];
+    uint8_t diagScanGot[32];
     bool wclBssValid;
     bool wclLinkIndicated;
     uint8_t wclBssInfo[sizeof(AirportWCL::BeaconMetadata) + 0x800];

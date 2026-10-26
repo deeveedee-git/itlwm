@@ -168,8 +168,11 @@ void AirportItlwmSkywalkInterface::free()
 IOReturn AirportItlwmSkywalkInterface::wclCommand(OSObject *, void *a0, void *a1, void *a2, void *)
 {
     auto self = static_cast<AirportItlwmSkywalkInterface *>(a0);
-    if (self->wclStopping)
+    if (self->wclStopping) {
+        if (uintptr_t(a1) == 0)
+            EVLOG("scan req refused: WCL stopping\n");
         return kIOReturnNotReady;
+    }
     switch (uintptr_t(a1)) {
         case 13: return self->copyWCLChannels(a2);
         case 14: return self->copyWCLTrafficCounters(a2);
@@ -184,9 +187,9 @@ IOReturn AirportItlwmSkywalkInterface::wclCommand(OSObject *, void *a0, void *a1
         case 9: return self->accessWCLRSN(static_cast<apple80211_rsn_ie_data *>(a2), true);
         case 10: return self->accessWCLRSN(static_cast<apple80211_rsn_ie_data *>(a2), false);
         case 0: return self->beginWCLScan(static_cast<apple80211ScanRequest *>(a2));
-        case 1: return self->beginWCLJoin(static_cast<apple80211AssocCandidates *>(a2));
-        case 2: return self->abortWCLJoin();
-        case 3: return self->leaveWCLNetwork();
+        case 1: EVLOG("cmd WCL_ASSOCIATE\n"); return self->beginWCLJoin(static_cast<apple80211AssocCandidates *>(a2));
+        case 2: EVLOG("cmd WCL_JOIN_ABORT\n"); return self->abortWCLJoin();
+        case 3: EVLOG("cmd WCL_LEAVE_NETWORK\n"); return self->leaveWCLNetwork();
         case 6: return self->copyWCLExtendedBss(a2);
         case 7:
             if (!a2 || !self->wclBssValid || !self->wclAssociatedBeacons)
@@ -234,12 +237,36 @@ IOReturn AirportItlwmSkywalkInterface::setWCL_LEAVE_NETWORK(apple80211_leave_net
     return _fCommandGate->runAction(wclCommand, this, reinterpret_cast<void *>(3));
 }
 
+// EVLOG diagnostics: "149,9,157" from a WCL channel bitmask.
+static void diagChannelList(const uint8_t *channels, char *buf, size_t size)
+{
+    size_t n = 0;
+    buf[0] = '\0';
+    for (unsigned channel = 1; channel < 256; ++channel) {
+        if (!(channels[channel / 8] & (1U << (channel % 8))))
+            continue;
+        if (n + 8 >= size) {
+            strlcat(buf, ",...", size);
+            return;
+        }
+        n += snprintf(buf + n, size - n, n ? ",%u" : "%u", channel);
+    }
+    if (!n)
+        strlcpy(buf, "none", size);
+}
+
 IOReturn AirportItlwmSkywalkInterface::beginWCLScan(apple80211ScanRequest *request)
 {
     AirportWCL::ScanRequest scan;
-    if (!AirportWCL::decodeScan(request, 0x1550, scan))
+    if (!AirportWCL::decodeScan(request, 0x1550, scan)) {
+        EVLOG("scan req: could not decode\n");
         return kIOReturnBadArgument;
+    }
     ieee80211com *ic = fHalService->get80211Controller();
+    int state = ic->ic_state;
+    uint64_t now = airport_up_time();
+    uint64_t sweepAge = ic->ic_diag_sweep_start ? now - ic->ic_diag_sweep_start : 0;
+    char channels[96];
     /*
      * The firmware restarts after wake and again to apply a private MAC
      * address; the system's first auto-join scans arrive during that and
@@ -253,11 +280,39 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLScan(apple80211ScanRequest *reque
         scanDeferred = scanPending = true;
         scanCompleted = scanSkipCompletion = false;
         scanSource->setTimeoutMS(20000);
+        diagScanId = scan.identifier;
+        diagScanStart = now;
+        diagScanResults = diagScanResultsInRequest = 0;
+        diagScanRestricted = scan.channelCount != 0;
+        memcpy(diagScanChannels, scan.channels, sizeof(diagScanChannels));
+        bzero(diagScanGot, sizeof(diagScanGot));
+        if (scan.channelCount)
+            diagChannelList(scan.channels, channels, sizeof(channels));
+        else
+            strlcpy(channels, "all", sizeof(channels));
+        EVLOG("scan req id=%u type=%u ch=%s state=%d reconfig=%d running=%d -> held until ready\n",
+              scan.identifier, scan.type, channels, state, ic->ic_wcl_mac_reconfig,
+              !!(ic->ic_if.if_flags & IFF_RUNNING));
         return kIOReturnSuccess;
     }
     IOReturn ret = startWCLScan(scan);
-    if (ret == kIOReturnSuccess)
+    if (scan.channelCount)
+        diagChannelList(scan.channels, channels, sizeof(channels));
+    else
+        strlcpy(channels, "all", sizeof(channels));
+    EVLOG("scan req id=%u type=%u ssid=%u ch=%s state=%d sweep#%u%s+%llums skip=%d -> 0x%x\n",
+          scan.identifier, scan.type, scan.ssidLength, channels, state, ic->ic_diag_sweep,
+          ic->ic_diag_sweep_start ? "" : "(idle)", (unsigned long long)sweepAge,
+          ret == kIOReturnSuccess && scanSkipCompletion, ret);
+    if (ret == kIOReturnSuccess) {
         deferredScan = scan;
+        diagScanId = scan.identifier;
+        diagScanStart = now;
+        diagScanResults = diagScanResultsInRequest = 0;
+        diagScanRestricted = scan.channelCount != 0;
+        memcpy(diagScanChannels, scan.channels, sizeof(diagScanChannels));
+        bzero(diagScanGot, sizeof(diagScanGot));
+    }
     return ret;
 }
 
@@ -327,12 +382,16 @@ void AirportItlwmSkywalkInterface::resumeWCLScan()
     if (!scanDeferred || wclStopping)
         return;
     if (joinPending) {
+        EVLOG("held scan id=%u dropped for a join\n", diagScanId);
         finishWCLScan(kIOReturnAborted);
         return;
     }
     AirportWCL::ScanRequest scan = deferredScan;
     scanDeferred = scanPending = false;
     IOReturn ret = startWCLScan(scan);
+    EVLOG("held scan id=%u started after %llums, state=%d -> 0x%x\n", diagScanId,
+          (unsigned long long)(airport_up_time() - diagScanStart),
+          fHalService->get80211Controller()->ic_state, ret);
     if (ret != kIOReturnSuccess) {
         scanPending = true;
         finishWCLScan(ret);
@@ -344,6 +403,12 @@ void AirportItlwmSkywalkInterface::finishWCLScan(IOReturn status)
     if (!scanPending)
         return;
     scanDeferred = false;
+    char got[96];
+    diagChannelList(diagScanGot, got, sizeof(got));
+    EVLOG("scan done id=%u status=0x%x after %llums: %u results, %u on requested channels (%s), sweep#%u\n",
+          diagScanId, status, (unsigned long long)(airport_up_time() - diagScanStart),
+          diagScanResults, diagScanResultsInRequest, got,
+          fHalService->get80211Controller()->ic_diag_sweep);
     scanPending = false;
     scanCompleted = false;
     scanSource->cancelTimeout();
@@ -367,6 +432,13 @@ void AirportItlwmSkywalkInterface::publishWCLBeacon(const ieee80211_node *node, 
     unsigned channel = ieee80211_chan2ieee(ic, node->ni_chan);
     if (!channel || channel > 196)
         return;
+    if (scanPending) {
+        diagScanResults++;
+        if (AirportWCL::scanChannelSelected(diagScanChannels, diagScanRestricted, channel)) {
+            diagScanResultsInRequest++;
+            diagScanGot[channel / 8] |= 1U << (channel % 8);
+        }
+    }
     size_t size = sizeof(AirportWCL::BeaconMetadata) + length;
     auto metadata = static_cast<AirportWCL::BeaconMetadata *>(IOMalloc(size));
     if (!metadata)
@@ -491,6 +563,7 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
         deferredJoin = join;
         memcpy(joinBSSID, join.bssid, sizeof(joinBSSID));
         explicit_bzero(&join, sizeof(join));
+        EVLOG("join deferred (%s)\n", ic->ic_wcl_mac_reconfig ? "mac reconfig" : "firmware loading");
         joinDeferred = joinPending = true;
         joinTimer->setTimeoutMS(30000);
         return kIOReturnSuccess;
@@ -499,8 +572,11 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
         explicit_bzero(&join, sizeof(join));
         return !supported ? kIOReturnUnsupported : kIOReturnBusy;
     }
-    if (ic->ic_state == IEEE80211_S_RUN || ic->ic_state == IEEE80211_S_AUTH || ic->ic_state == IEEE80211_S_ASSOC)
+    EVLOG("startWCLJoin state=%d\n", ic->ic_state);
+    if (ic->ic_state == IEEE80211_S_RUN || ic->ic_state == IEEE80211_S_AUTH || ic->ic_state == IEEE80211_S_ASSOC) {
+        EVLOG("startWCLJoin -> leave current association first\n");
         leaveWCLNetwork();
+    }
     ieee80211_disable_rsn(ic);
     ieee80211_disable_wep(ic);
     explicit_bzero(ic->ic_psk, sizeof(ic->ic_psk));
@@ -614,11 +690,14 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
 
 void AirportItlwmSkywalkInterface::resumeWCLJoin()
 {
+    EVLOG("resumeWCLJoin deferred=%d stopping=%d\n", joinDeferred, wclStopping);
     if (!joinDeferred || wclStopping)
         return;
     // A join outranks a held scan, which would make startWCLJoin() busy.
-    if (scanDeferred)
+    if (scanDeferred) {
+        EVLOG("held scan id=%u dropped for a join\n", diagScanId);
         finishWCLScan(kIOReturnAborted);
+    }
     AirportWCL::JoinRequest join = deferredJoin;
     explicit_bzero(&deferredJoin, sizeof(deferredJoin));
     joinDeferred = joinPending = false;
@@ -660,6 +739,7 @@ void AirportItlwmSkywalkInterface::wclJoinTimeout(OSObject *owner, IOTimerEventS
 {
     auto self = OSDynamicCast(AirportItlwmSkywalkInterface, owner);
     if (self && !self->wclStopping) {
+        EVLOG("join timer fired, joinPending=%d\n", self->joinPending);
         self->finishWCLJoin(1, 1004, kIOReturnTimeout);
         self->leaveWCLNetwork();
     }
@@ -668,6 +748,8 @@ void AirportItlwmSkywalkInterface::wclJoinTimeout(OSObject *owner, IOTimerEventS
 IOReturn AirportItlwmSkywalkInterface::leaveWCLNetwork()
 {
     ieee80211com *ic = fHalService->get80211Controller();
+    EVLOG("leaveWCLNetwork state=%d joinPending=%d joinDeferred=%d\n",
+          ic->ic_state, joinPending, joinDeferred);
     portAuthorized = false;
     updateWCLLinkQuality(true);
     joinPending = false;
@@ -755,14 +837,16 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
             event.available = 1;
             event.reason = 0xe0821803;
             instance->postMessage(this, AirportWCL::DriverAvailable, &event, sizeof(event), true);
+            EVLOG("driver available posted at firmware start\n");
             break;
         }
         case IEEE80211_EVT_DRIVER_READY:
         case IEEE80211_EVT_DRIVER_STOPPED: {
             bool ready = code == IEEE80211_EVT_DRIVER_READY;
             if (!ready) {
-                // Hold a pending scan across the restart that applies a MAC address.
                 if (ic->ic_wcl_mac_reconfig && scanPending && !wclStopping) {
+                    if (!scanDeferred)
+                        EVLOG("scan id=%u held across the MAC reconfig restart\n", diagScanId);
                     scanDeferred = true;
                     scanCompleted = false;
                 } else
@@ -778,6 +862,8 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
             // An address application is requested by WCL itself, not a new
             // adapter reset. Replaying firmware-load events here rotates the
             // scan MAC again and recursively restarts the card.
+            EVLOG("driver reset event ready=%d mac_reconfig=%d state=%d\n",
+                  ready, ic->ic_wcl_mac_reconfig, ic->ic_state);
             if (AirportWCL::consumeMacReconfiguration(ic->ic_wcl_mac_reconfig, ready)) {
                 if (ready) {
                     resumeWCLJoin();
@@ -864,16 +950,14 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
             break;
         }
         case IEEE80211_EVT_SCAN_DONE:
-            /*
-             * The end of a scan being replaced (ic_scan_restart), or of one
-             * from before the reset that a held request waits through.
-             */
-            if (scanPending && (scanDeferred || ic->ic_scan_restart))
-                break;
-            if (scanPending) {
-                if (scanSkipCompletion)
+            if (scanPending && (scanDeferred || ic->ic_scan_restart)) {
+                EVLOG("scan id=%u: end of a %s scan ignored (sweep#%u)\n", diagScanId,
+                      scanDeferred ? "pre-reset" : "replaced", ic->ic_diag_sweep);
+            } else if (scanPending) {
+                if (scanSkipCompletion) {
                     scanSkipCompletion = false;
-                else {
+                    EVLOG("scan id=%u: sweep end skipped (waits for next sweep)\n", diagScanId);
+                } else {
                     scanCompleted = true;
                     scanSource->setTimeoutMS(0);
                 }
