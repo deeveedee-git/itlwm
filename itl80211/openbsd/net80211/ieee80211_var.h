@@ -463,6 +463,13 @@ struct ieee80211com {
      */
     uint8_t         ic_join_chan;
     /*
+     * Channel of the scan that just ran as such a one-channel join scan
+     * (0 = the last scan wasn't one), and how often it was repeated because
+     * the BSS wasn't found: one look can miss it.
+     */
+    uint8_t         ic_join_chan_scanned;
+    uint8_t         ic_join_chan_retries;
+    /*
      * Set with a SCAN -> SCAN transition by a system scan request: the driver
      * restarts the scan in progress, so that the requested channels are
      * scanned while the request is pending.

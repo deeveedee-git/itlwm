@@ -579,6 +579,7 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
         unsigned channel = join.channelSpec & 0xff;
         ic->ic_join_chan = (channel > 0 && channel <= IEEE80211_CHAN_MAX &&
                             ic->ic_channels[channel].ic_flags) ? channel : 0;
+        ic->ic_join_chan_retries = 0;
     }
     explicit_bzero(&join, sizeof(join));
     wclBssValid = false;
