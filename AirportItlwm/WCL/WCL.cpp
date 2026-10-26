@@ -793,6 +793,9 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
             break;
         }
         case IEEE80211_EVT_SCAN_DONE:
+            /* The end of a scan being replaced (ic_scan_restart). */
+            if (scanPending && ic->ic_scan_restart)
+                break;
             if (scanPending) {
                 if (scanSkipCompletion)
                     scanSkipCompletion = false;
