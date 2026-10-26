@@ -9263,11 +9263,13 @@ iwx_scan_abort(struct iwx_softc *sc)
     XYLog("%s\n", __FUNCTION__);
     int err;
     
+    /* The aborted scan's completion can arrive while we wait for the reply. */
+    sc->sc_scan_abort_pending = true;
     err = iwx_umac_scan_abort(sc);
-    if (err == 0) {
+    if (err == 0)
         sc->sc_flags &= ~(IWX_FLAG_SCANNING | IWX_FLAG_BGSCAN);
-        sc->sc_scan_abort_pending = true;
-    }
+    else
+        sc->sc_scan_abort_pending = false;
     return err;
 }
 
@@ -10437,10 +10439,16 @@ iwx_newstate_task(void *psc)
              * request completes with the scan in progress.
              */
             if (ic->ic_scan_restart) {
-                ic->ic_scan_restart = false;
+                /*
+                 * Cleared only now: while it is set, the end of the old scan
+                 * doesn't complete the system request.
+                 */
                 if (!(sc->sc_flags & IWX_FLAG_SCANNING) ||
-                    that->iwx_scan_abort(sc) == 0)
+                    that->iwx_scan_abort(sc) == 0) {
+                    ic->ic_scan_restart = false;
                     goto next_scan;
+                }
+                ic->ic_scan_restart = false;
             }
             if (sc->sc_flags & IWX_FLAG_SCANNING) {
                 //                refcnt_rele_wake(&sc->task_refs);
