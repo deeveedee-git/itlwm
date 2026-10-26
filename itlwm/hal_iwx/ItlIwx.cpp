@@ -7948,6 +7948,8 @@ iwx_umac_scan_fill_channels(struct iwx_softc *sc,
         chan++;
         nchan++;
     }
+    if (!bgscan)
+        ic->ic_join_chan_scanned = join_chan;
     
     return nchan;
 }
