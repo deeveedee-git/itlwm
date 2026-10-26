@@ -441,6 +441,8 @@ private:
     void resumeWCLJoin();
     IOReturn abortWCLJoin();
     IOReturn leaveWCLNetwork();
+    IOReturn startWCLScan(AirportWCL::ScanRequest &);
+    void resumeWCLScan();
     void finishWCLScan(IOReturn);
     void finishWCLJoin(uint16_t, uint16_t, IOReturn);
     void publishWCLBeacon(const ieee80211_node *, const uint8_t *, size_t);
@@ -449,6 +451,9 @@ private:
     bool scanPending;
     bool scanCompleted;
     bool scanSkipCompletion;
+    // A scan request held while the firmware restarts (resumeWCLScan).
+    bool scanDeferred = false;
+    AirportWCL::ScanRequest deferredScan = {};
     bool wclBssValid;
     bool wclLinkIndicated;
     uint8_t wclBssInfo[sizeof(AirportWCL::BeaconMetadata) + 0x800];

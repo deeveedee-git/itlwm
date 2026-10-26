@@ -98,7 +98,7 @@ void AirportItlwmSkywalkInterface::stopWCL()
     if (scanSource)
         scanSource->cancelTimeout();
     scanPending = joinPending = false;
-    joinDeferred = false;
+    joinDeferred = scanDeferred = false;
     explicit_bzero(&deferredJoin, sizeof(deferredJoin));
     if (fHalService) {
         ieee80211com *ic = fHalService->get80211Controller();
@@ -240,6 +240,30 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLScan(apple80211ScanRequest *reque
     if (!AirportWCL::decodeScan(request, 0x1550, scan))
         return kIOReturnBadArgument;
     ieee80211com *ic = fHalService->get80211Controller();
+    /*
+     * The firmware restarts after wake and again to apply a private MAC
+     * address; the system's first auto-join scans arrive during that and
+     * would fail, so its next try comes ~18 s later. Hold the request and
+     * start it when the driver is ready (resumeWCLScan).
+     */
+    if ((ic->ic_if.if_flags & IFF_UP) && !scanPending && !joinPending &&
+        (ic->ic_wcl_mac_reconfig || !(ic->ic_if.if_flags & IFF_RUNNING) ||
+         ic->ic_state == IEEE80211_S_INIT)) {
+        deferredScan = scan;
+        scanDeferred = scanPending = true;
+        scanCompleted = scanSkipCompletion = false;
+        scanSource->setTimeoutMS(20000);
+        return kIOReturnSuccess;
+    }
+    IOReturn ret = startWCLScan(scan);
+    if (ret == kIOReturnSuccess)
+        deferredScan = scan;
+    return ret;
+}
+
+IOReturn AirportItlwmSkywalkInterface::startWCLScan(AirportWCL::ScanRequest &scan)
+{
+    ieee80211com *ic = fHalService->get80211Controller();
     if (!(ic->ic_if.if_flags & IFF_RUNNING))
         return kIOReturnNotReady;
     if (scanPending || joinPending || (ic->ic_flags & IEEE80211_F_BGSCAN))
@@ -298,10 +322,28 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLScan(apple80211ScanRequest *reque
     return kIOReturnSuccess;
 }
 
+void AirportItlwmSkywalkInterface::resumeWCLScan()
+{
+    if (!scanDeferred || wclStopping)
+        return;
+    if (joinPending) {
+        finishWCLScan(kIOReturnAborted);
+        return;
+    }
+    AirportWCL::ScanRequest scan = deferredScan;
+    scanDeferred = scanPending = false;
+    IOReturn ret = startWCLScan(scan);
+    if (ret != kIOReturnSuccess) {
+        scanPending = true;
+        finishWCLScan(ret);
+    }
+}
+
 void AirportItlwmSkywalkInterface::finishWCLScan(IOReturn status)
 {
     if (!scanPending)
         return;
+    scanDeferred = false;
     scanPending = false;
     scanCompleted = false;
     scanSource->cancelTimeout();
@@ -570,6 +612,9 @@ void AirportItlwmSkywalkInterface::resumeWCLJoin()
 {
     if (!joinDeferred || wclStopping)
         return;
+    // A join outranks a held scan, which would make startWCLJoin() busy.
+    if (scanDeferred)
+        finishWCLScan(kIOReturnAborted);
     AirportWCL::JoinRequest join = deferredJoin;
     explicit_bzero(&deferredJoin, sizeof(deferredJoin));
     joinDeferred = joinPending = false;
@@ -699,7 +744,12 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
         case IEEE80211_EVT_DRIVER_STOPPED: {
             bool ready = code == IEEE80211_EVT_DRIVER_READY;
             if (!ready) {
-                finishWCLScan(ic->ic_wcl_mac_reconfig ? kIOReturnAborted : kIOReturnOffline);
+                // Hold a pending scan across the restart that applies a MAC address.
+                if (ic->ic_wcl_mac_reconfig && scanPending && !wclStopping) {
+                    scanDeferred = true;
+                    scanCompleted = false;
+                } else
+                    finishWCLScan(ic->ic_wcl_mac_reconfig ? kIOReturnAborted : kIOReturnOffline);
                 finishWCLJoin(1, 0, kIOReturnOffline);
                 portAuthorized = false;
                 updateWCLLinkQuality(true);
@@ -712,8 +762,10 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
             // adapter reset. Replaying firmware-load events here rotates the
             // scan MAC again and recursively restarts the card.
             if (AirportWCL::consumeMacReconfiguration(ic->ic_wcl_mac_reconfig, ready)) {
-                if (ready)
+                if (ready) {
                     resumeWCLJoin();
+                    resumeWCLScan();
+                }
                 break;
             }
             if (ready) {
@@ -725,8 +777,10 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
             event.available = ready;
             event.reason = ready ? 0xe0821803 : 0xe0821804;
             instance->postMessage(this, AirportWCL::DriverAvailable, &event, sizeof(event), true);
-            if (ready)
+            if (ready) {
                 resumeWCLJoin();
+                resumeWCLScan();
+            }
             break;
         }
         case IEEE80211_EVT_BEACON: {
@@ -793,8 +847,11 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
             break;
         }
         case IEEE80211_EVT_SCAN_DONE:
-            /* The end of a scan being replaced (ic_scan_restart). */
-            if (scanPending && ic->ic_scan_restart)
+            /*
+             * The end of a scan being replaced (ic_scan_restart), or of one
+             * from before the reset that a held request waits through.
+             */
+            if (scanPending && (scanDeferred || ic->ic_scan_restart))
                 break;
             if (scanPending) {
                 if (scanSkipCompletion)
