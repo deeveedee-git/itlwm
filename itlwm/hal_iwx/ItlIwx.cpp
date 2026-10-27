@@ -5061,7 +5061,8 @@ iwx_load_firmware(struct iwx_softc *sc)
         return err;
     }
     
-    err = iwx_wait_notification(sc, &sc->sc_uc.uc_intr, 1, 1000);
+    err = iwx_wait_notification(sc, &sc->sc_uc.uc_intr, 1,
+                                sc->sc_alive_timeout ? sc->sc_alive_timeout : 1000);
     if (err == ENXIO)
         return err;
     if (!err && !sc->sc_uc.uc_ok)
@@ -11057,7 +11058,16 @@ iwx_init(struct _ifnet *ifp)
         ic->ic_event_handler(ic, IEEE80211_EVT_DRIVER_RESET_BEGIN, NULL);
 #endif
     for (int attempt = 0; ; attempt++) {
+        /*
+         * After some wakes from S0ix the first firmware load never reports
+         * ALIVE (the UMAC starts, the LMAC doesn't), while a normal load
+         * reports it after about 100-110 ms. The retry below, after
+         * iwx_stop_device(), always works; so wait only 300 ms on the first
+         * attempt instead of 1 s, and the full time on the retry.
+         */
+        sc->sc_alive_timeout = attempt == 0 ? 300 : 1000;
         err = iwx_init_hw(sc);
+        sc->sc_alive_timeout = 0;
         if (generation != sc->sc_generation)
             return ENXIO;
         if (!err)
