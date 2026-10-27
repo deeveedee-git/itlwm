@@ -483,8 +483,11 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
     // Applying a private MAC restarts firmware asynchronously. WCL can issue
     // the association before that restart has completed; keep one request
     // until the HAL reports READY rather than making the user retry it.
-    if (supported && !joinPending && ic->ic_wcl_mac_reconfig &&
-        (ic->ic_if.if_flags & IFF_UP)) {
+    // Also while the firmware loads after wake: the driver is reported
+    // available at firmware start (IEEE80211_EVT_DRIVER_RESET_BEGIN).
+    if (supported && !joinPending && (ic->ic_if.if_flags & IFF_UP) &&
+        (ic->ic_wcl_mac_reconfig || !(ic->ic_if.if_flags & IFF_RUNNING) ||
+         ic->ic_state == IEEE80211_S_INIT)) {
         deferredJoin = join;
         memcpy(joinBSSID, join.bssid, sizeof(joinBSSID));
         explicit_bzero(&join, sizeof(join));
@@ -739,6 +742,19 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
             }
             uint32_t reset = 0; // Native resetInterfacesBegin.
             instance->postMessage(this, AirportWCL::ResetInterface, &reset, sizeof(reset), true);
+            /*
+             * The system marks the driver unavailable at sleep and refuses
+             * scans itself until we say otherwise, which we used to do only
+             * when the firmware was ready (~0.2 s after wake). Say it now:
+             * scans that arrive while the firmware loads reach beginWCLScan(),
+             * which holds them until DRIVER_READY. A failed start still ends
+             * with DRIVER_STOPPED (unavailable).
+             */
+            AirportWCL::DriverAvailability event = {};
+            event.version = 3;
+            event.available = 1;
+            event.reason = 0xe0821803;
+            instance->postMessage(this, AirportWCL::DriverAvailable, &event, sizeof(event), true);
             break;
         }
         case IEEE80211_EVT_DRIVER_READY:
