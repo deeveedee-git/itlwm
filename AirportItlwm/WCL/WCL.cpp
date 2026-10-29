@@ -736,8 +736,11 @@ IOReturn AirportItlwmSkywalkInterface::leaveWCLNetwork()
      * change) and answered the next authentication with a disassoc
      * (reason 8), costing ~4 s per join. As setDISASSOCIATE does.
      */
-    if (ic->ic_state > IEEE80211_S_AUTH && ic->ic_bss != NULL)
+    if (ic->ic_state > IEEE80211_S_AUTH && ic->ic_bss != NULL) {
+        ic->ic_deauth_tx_pending = 1;
         IEEE80211_SEND_MGMT(ic, ic->ic_bss, IEEE80211_FC0_SUBTYPE_DEAUTH, IEEE80211_REASON_AUTH_LEAVE);
+        waitWCLDeauthTx();
+    }
     if (ic->ic_state > IEEE80211_S_SCAN)
         ieee80211_new_state(ic, IEEE80211_S_SCAN, -1);
     ieee80211_disable_rsn(ic);
@@ -749,6 +752,30 @@ IOReturn AirportItlwmSkywalkInterface::leaveWCLNetwork()
     ic->ic_des_esslen = 0;
     bzero(ic->ic_des_essid, sizeof(ic->ic_des_essid));
     return kIOReturnSuccess;
+}
+
+/*
+ * Wait (up to 20 ms) until the leave deauth has been transmitted. Leaving
+ * RUN flushes the Tx path and the system may stop the card right after; the
+ * deauth needs ~3-4 ms and was lost when either came first.
+ */
+void AirportItlwmSkywalkInterface::waitWCLDeauthTx()
+{
+    ieee80211com *ic = fHalService->get80211Controller();
+    IOCommandGate *gate = _fCommandGate;
+    if (!gate)
+        return;
+    gate->runAction([](OSObject *, void *a0, void *a1, void *, void *) -> IOReturn {
+        ieee80211com *ic = static_cast<ieee80211com *>(a0);
+        IOCommandGate *gate = static_cast<IOCommandGate *>(a1);
+        AbsoluteTime deadline;
+        clock_interval_to_deadline(20, kMillisecondScale, reinterpret_cast<uint64_t *>(&deadline));
+        while (ic->ic_deauth_tx_pending)
+            if (gate->commandSleep(&ic->ic_deauth_tx_pending, deadline, THREAD_UNINT) != THREAD_AWAKENED)
+                break;
+        ic->ic_deauth_tx_pending = 0;
+        return kIOReturnSuccess;
+    }, ic, gate);
 }
 
 IOReturn AirportItlwmSkywalkInterface::abortWCLJoin()

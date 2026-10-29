@@ -6179,6 +6179,10 @@ iwx_rx_tx_cmd_single(struct iwx_softc *sc, struct iwx_rx_packet *pkt,
     KASSERT(tx_resp->frame_count == 1, "tx_resp->frame_count == 1");
     
     txfail = (status != IWX_TX_STATUS_SUCCESS);
+    if (txd->type == IEEE80211_FC0_TYPE_MGT && ic->ic_deauth_tx_pending) {
+        ic->ic_deauth_tx_pending = 0;
+        getMainCommandGate()->commandWakeup(&ic->ic_deauth_tx_pending);
+    }
     
     if (txfail) {
         DPRINTFN(3, ("%s %d OUTPUT_ERROR type=%d status=%d\n", __FUNCTION__, __LINE__, txd->type, status));
@@ -11300,6 +11304,10 @@ iwx_stop(struct _ifnet *ifp)
     
     //    rw_assert_wrlock(&sc->ioctl_rwl);
     
+    if (ic->ic_deauth_tx_pending) {
+        ic->ic_deauth_tx_pending = 0;
+        getMainCommandGate()->commandWakeup(&ic->ic_deauth_tx_pending);
+    }
     sc->sc_flags |= IWX_FLAG_SHUTDOWN; /* Disallow new tasks. */
     sc->sc_generation++;
     getMainCommandGate()->commandWakeup(&sc->sc_uc.uc_intr);

@@ -455,6 +455,7 @@ private:
     void keepWCLScanResult(const AirportWCL::BeaconMetadata *, size_t);
     void clearWCLScanResults();
     void postWCLLinkUp();
+    void waitWCLDeauthTx();
     IOTimerEventSource *joinTimer;
     uint8_t joinBSSID[6];
     bool scanPending;
