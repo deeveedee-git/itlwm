@@ -5052,6 +5052,20 @@ iwx_wait_notification(struct iwx_softc *sc, int *value, int bits, uint32_t milli
     return generation == sc->sc_generation ? 0 : ENXIO;
 }
 
+/*
+ * After a scan abort, wait (up to 100 ms) for the aborted scan's completion
+ * notification before sending another scan request, as iwlwifi does: a scan
+ * request sent before it occasionally makes the UMAC assert (0x20002806).
+ * Returns nonzero if the firmware was restarted meanwhile.
+ */
+int ItlIwx::
+iwx_wait_scan_abort_done(struct iwx_softc *sc, int generation)
+{
+    if (!sc->sc_scan_abort_done)
+        iwx_wait_notification(sc, &sc->sc_scan_abort_done, 1, 100);
+    return generation != sc->sc_generation;
+}
+
 int ItlIwx::
 iwx_load_firmware(struct iwx_softc *sc)
 {
@@ -9287,6 +9301,7 @@ iwx_scan_abort(struct iwx_softc *sc)
     
     /* The aborted scan's completion can arrive while we wait for the reply. */
     sc->sc_scan_abort_pending = true;
+    sc->sc_scan_abort_done = 0;
     err = iwx_umac_scan_abort(sc);
     if (err == 0)
         sc->sc_flags &= ~(IWX_FLAG_SCANNING | IWX_FLAG_BGSCAN);
@@ -10425,6 +10440,7 @@ iwx_newstate_task(void *psc)
     enum ieee80211_state ostate = ic->ic_state;
     int generation = sc->sc_generation;
     int arg = sc->ns_arg;
+    bool aborted;
     int err = 0, s = splnet();
     
     XYLog("%s sc->sc_flags & IWX_FLAG_SHUTDOWN %s\n", __FUNCTION__, sc->sc_flags & IWX_FLAG_SHUTDOWN ? "true" : "false");
@@ -10448,9 +10464,14 @@ iwx_newstate_task(void *psc)
             if (ic->ic_join_now) {
                 ic->ic_join_now = false;
                 ic->ic_scan_restart = false;
-                err = (sc->sc_flags & IWX_FLAG_SCANNING) ? that->iwx_scan_abort(sc) : 0;
+                aborted = (sc->sc_flags & IWX_FLAG_SCANNING) != 0;
+                err = aborted ? that->iwx_scan_abort(sc) : 0;
                 /* The abort waits for the firmware, which may have been restarted meanwhile. */
                 if (generation != sc->sc_generation) {
+                    splx(s);
+                    return;
+                }
+                if (aborted && err == 0 && that->iwx_wait_scan_abort_done(sc, generation)) {
                     splx(s);
                     return;
                 }
@@ -10471,7 +10492,8 @@ iwx_newstate_task(void *psc)
                  * Cleared only now: while it is set, the end of the old scan
                  * doesn't complete the system request.
                  */
-                err = (sc->sc_flags & IWX_FLAG_SCANNING) ? that->iwx_scan_abort(sc) : 0;
+                aborted = (sc->sc_flags & IWX_FLAG_SCANNING) != 0;
+                err = aborted ? that->iwx_scan_abort(sc) : 0;
                 /*
                  * The abort waits for the firmware's reply. If the firmware
                  * was restarted meanwhile (iwx_stop(), e.g. for a new MAC
@@ -10480,6 +10502,10 @@ iwx_newstate_task(void *psc)
                  * (0x103D) when it starts.
                  */
                 if (generation != sc->sc_generation) {
+                    splx(s);
+                    return;
+                }
+                if (aborted && err == 0 && that->iwx_wait_scan_abort_done(sc, generation)) {
                     splx(s);
                     return;
                 }
@@ -12034,8 +12060,11 @@ iwx_rx_pkt(struct iwx_softc *sc, struct iwx_rx_data *data, struct mbuf_list *ml)
                 SYNC_RESP_STRUCT(notif, pkt, struct iwx_umac_scan_complete *);
                 /* The end of an aborted scan, not of the one that followed. */
                 if (sc->sc_scan_abort_pending &&
-                    notif->status == IWX_SCAN_OFFLOAD_ABORTED)
+                    notif->status == IWX_SCAN_OFFLOAD_ABORTED) {
+                    sc->sc_scan_abort_done = 1;
+                    getMainCommandGate()->commandWakeup(&sc->sc_scan_abort_done);
                     break;
+                }
                 sc->sc_scan_abort_pending = false;
                 iwx_endscan(sc);
                 break;

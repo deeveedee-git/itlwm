@@ -695,6 +695,8 @@ struct iwx_softc {
 	int sc_flags;
 	/* A scan was aborted; its completion must not end the next scan. */
 	bool sc_scan_abort_pending;
+	/* 1 once the aborted scan's completion notification has arrived. */
+	int sc_scan_abort_done;
 	/* How long to wait for ALIVE, in ms (0 = the default 1000 ms). */
 	uint32_t sc_alive_timeout;
 

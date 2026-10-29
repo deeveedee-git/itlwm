@@ -369,6 +369,7 @@ public:
             uint8_t, uint32_t, uint32_t);
     int    iwx_send_cmd(struct iwx_softc *, struct iwx_host_cmd *);
     int    iwx_wait_notification(struct iwx_softc *, int *, int, uint32_t);
+    int    iwx_wait_scan_abort_done(struct iwx_softc *, int);
     int    iwx_send_cmd_pdu(struct iwx_softc *, uint32_t, uint32_t, uint16_t,
             const void *);
     int    iwx_send_cmd_status(struct iwx_softc *, struct iwx_host_cmd *,
