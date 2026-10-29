@@ -9201,6 +9201,9 @@ iwx_del_task(struct iwx_softc *sc, struct taskq *taskq, struct task *task)
 int ItlIwx::
 iwx_scan(struct iwx_softc *sc)
 {
+    /* A scan command sent while the firmware loads makes it assert when it starts. */
+    if (!sc->sc_uc.uc_ok)
+        return ENXIO;
     XYLog("%s\n", __FUNCTION__);
     struct ieee80211com *ic = &sc->sc_ic;
     struct _ifnet *ifp = IC2IFP(ic);
@@ -9267,6 +9270,8 @@ iwx_bgscan(struct ieee80211com *ic)
 int ItlIwx::
 iwx_umac_scan_abort(struct iwx_softc *sc)
 {
+    if (!sc->sc_uc.uc_ok)
+        return ENXIO;
     struct iwx_umac_scan_abort cmd = { 0 };
     
     return iwx_send_cmd_pdu(sc,
@@ -10443,12 +10448,18 @@ iwx_newstate_task(void *psc)
             if (ic->ic_join_now) {
                 ic->ic_join_now = false;
                 ic->ic_scan_restart = false;
-                if (!(sc->sc_flags & IWX_FLAG_SCANNING) ||
-                    that->iwx_scan_abort(sc) == 0) {
+                err = (sc->sc_flags & IWX_FLAG_SCANNING) ? that->iwx_scan_abort(sc) : 0;
+                /* The abort waits for the firmware, which may have been restarted meanwhile. */
+                if (generation != sc->sc_generation) {
+                    splx(s);
+                    return;
+                }
+                if (err == 0) {
                     ieee80211_end_scan(&ic->ic_if);
                     splx(s);
                     return;
                 }
+                err = 0;
             }
             /*
              * A system scan request arrived during our scan: start over
@@ -10460,8 +10471,19 @@ iwx_newstate_task(void *psc)
                  * Cleared only now: while it is set, the end of the old scan
                  * doesn't complete the system request.
                  */
-                if (!(sc->sc_flags & IWX_FLAG_SCANNING) ||
-                    that->iwx_scan_abort(sc) == 0) {
+                err = (sc->sc_flags & IWX_FLAG_SCANNING) ? that->iwx_scan_abort(sc) : 0;
+                /*
+                 * The abort waits for the firmware's reply. If the firmware
+                 * was restarted meanwhile (iwx_stop(), e.g. for a new MAC
+                 * address), this task is stale: a scan command now would
+                 * reach a firmware that is still loading, which then asserts
+                 * (0x103D) when it starts.
+                 */
+                if (generation != sc->sc_generation) {
+                    splx(s);
+                    return;
+                }
+                if (err == 0) {
                     ic->ic_scan_restart = false;
                     goto next_scan;
                 }
