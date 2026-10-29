@@ -638,6 +638,7 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
     wclBssValid = false;
     joinPending = true;
     assocNotified = firstBeaconNotified = portAuthorized = false;
+    wclFirstBeaconHeld = false;
     wclAssociatedBeacons = 0;
     bzero(wclBeaconInfo, sizeof(wclBeaconInfo));
     disassocIsVoluntary = false;
@@ -757,6 +758,21 @@ IOReturn AirportItlwmSkywalkInterface::abortWCLJoin()
     return kIOReturnSuccess;
 }
 
+void AirportItlwmSkywalkInterface::postWCLLinkUp()
+{
+    AirportWCL::FirstBeaconEvent event = {};
+    memcpy(event.peer.bssid, joinBSSID, 6);
+    firstBeaconNotified = true;
+    wclFirstBeaconHeld = false;
+    AirportWCL::LinkStatusEvent link = {};
+    memcpy(link.bssid, joinBSSID, sizeof(link.bssid));
+    link.up = 1;
+    link.reason = 255;
+    wclLinkIndicated = true;
+    instance->postMessage(this, AirportWCL::LinkStatus, &link, sizeof(link), true);
+    instance->postMessage(this, AirportWCL::FirstBeacon, &event, sizeof(event), true);
+}
+
 void AirportItlwmSkywalkInterface::handleWCLLink(bool up)
 {
     if (wclStopping)
@@ -770,6 +786,8 @@ void AirportItlwmSkywalkInterface::handleWCLLink(bool up)
         wclBssValid = false;
         instance->postMessage(this, AirportWCL::LinkStatus, &event, sizeof(event), true);
     }
+    if (up && joinPending && assocNotified && wclFirstBeaconHeld && !firstBeaconNotified && wclBssValid)
+        postWCLLinkUp();
     if (up && joinPending && firstBeaconNotified)
         finishWCLJoin(0, 0, kIOReturnSuccess);
     updateWCLLinkQuality(true);
@@ -904,20 +922,21 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
                 publishWCLBeacon(beacon->node, beacon->ies, beacon->length);
             if (joinPending && assocNotified && !firstBeaconNotified &&
                 IEEE80211_ADDR_EQ(beacon->node->ni_bssid, joinBSSID)) {
-                AirportWCL::FirstBeaconEvent event = {};
-                memcpy(event.peer.bssid, joinBSSID, 6);
                 if (!wclBssValid)
                     break;
-                firstBeaconNotified = true;
-                AirportWCL::LinkStatusEvent link = {};
-                memcpy(link.bssid, joinBSSID, sizeof(link.bssid));
-                link.up = 1;
-                link.reason = 255;
-                wclLinkIndicated = true;
-                instance->postMessage(this, AirportWCL::LinkStatus, &link, sizeof(link), true);
-                instance->postMessage(this, AirportWCL::FirstBeacon, &event, sizeof(event), true);
-                if (portAuthorized)
-                    finishWCLJoin(0, 0, kIOReturnSuccess);
+                /*
+                 * Link up before the port is authorized (4-way handshake not
+                 * done) can make the system drop the link at once
+                 * (WCL_LEAVE_NETWORK 0.2 ms later) and the join then times
+                 * out after 10 s. Hold it; handleWCLLink() posts it when the
+                 * port is authorized.
+                 */
+                if (!portAuthorized) {
+                    wclFirstBeaconHeld = true;
+                    break;
+                }
+                postWCLLinkUp();
+                finishWCLJoin(0, 0, kIOReturnSuccess);
             }
             break;
         }

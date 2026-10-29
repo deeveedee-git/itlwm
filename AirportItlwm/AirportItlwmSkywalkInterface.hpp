@@ -454,6 +454,7 @@ private:
     void publishWCLBeacon(const ieee80211_node *, const uint8_t *, size_t);
     void keepWCLScanResult(const AirportWCL::BeaconMetadata *, size_t);
     void clearWCLScanResults();
+    void postWCLLinkUp();
     IOTimerEventSource *joinTimer;
     uint8_t joinBSSID[6];
     bool scanPending;
@@ -487,6 +488,8 @@ private:
     AirportWCL::JoinRequest deferredJoin = {};
     bool assocNotified;
     bool firstBeaconNotified;
+    // The joined BSS's first beacon arrived before the port was authorized.
+    bool wclFirstBeaconHeld = false;
     bool portAuthorized;
     uint8_t wclPermanentMAC[6] = {};
     bool wclStopping;
