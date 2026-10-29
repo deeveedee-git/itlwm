@@ -162,6 +162,7 @@ void AirportItlwmSkywalkInterface::free()
 {
     if (joinTimer)
         stopWCL();
+    clearWCLScanResults();
     IO80211InfraProtocol::free();
 }
 
@@ -253,11 +254,14 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLScan(apple80211ScanRequest *reque
         scanDeferred = scanPending = true;
         scanCompleted = scanSkipCompletion = false;
         scanSource->setTimeoutMS(20000);
+        clearWCLScanResults();
         return kIOReturnSuccess;
     }
     IOReturn ret = startWCLScan(scan);
-    if (ret == kIOReturnSuccess)
+    if (ret == kIOReturnSuccess) {
         deferredScan = scan;
+        clearWCLScanResults();
+    }
     return ret;
 }
 
@@ -348,6 +352,19 @@ void AirportItlwmSkywalkInterface::finishWCLScan(IOReturn status)
     scanCompleted = false;
     scanSource->cancelTimeout();
     fHalService->get80211Controller()->ic_wcl_scan_requested = false;
+    /*
+     * Each result was posted when its beacon arrived, and the system dates
+     * results by arrival. When it asks for a long scan with a short maximum
+     * age (the rest of the channels in an auto-join round, ~0.7 s against a
+     * ~3.5 s scan), it discards everything heard before the last ~0.7 s,
+     * often the network it is looking for. Post the latest result per BSS
+     * again now, so all of them are current when the scan completes.
+     */
+    if (status == kIOReturnSuccess)
+        for (unsigned i = 0; i < wclScanResultCount; i++)
+            instance->postMessage(this, AirportWCL::ScanResult, wclScanResults[i].data,
+                                  wclScanResults[i].size, true);
+    clearWCLScanResults();
     instance->postMessage(this, AirportWCL::ScanDone, &status, sizeof(status), true);
 }
 
@@ -393,8 +410,41 @@ void AirportItlwmSkywalkInterface::publishWCLBeacon(const ieee80211_node *node, 
             memcpy(wclBssInfo, metadata, messageSize);
         }
     }
+    if (scanPending && AirportWCL::scanChannelSelected(deferredScan.channels, deferredScan.channelCount != 0, channel))
+        keepWCLScanResult(metadata, messageSize);
     instance->postMessage(this, AirportWCL::ScanResult, metadata, messageSize, true);
     IOFree(metadata, size);
+}
+
+void AirportItlwmSkywalkInterface::keepWCLScanResult(const AirportWCL::BeaconMetadata *metadata, size_t size)
+{
+    unsigned i;
+    for (i = 0; i < wclScanResultCount; i++)
+        if (wclScanResults[i].channel == metadata->channel &&
+            !memcmp(wclScanResults[i].bssid, metadata->bssid, 6))
+            break;
+    if (i == kWCLScanResultCopies)
+        return;
+    void *data = IOMalloc(size);
+    if (!data)
+        return;
+    memcpy(data, metadata, size);
+    if (i < wclScanResultCount)
+        IOFree(wclScanResults[i].data, wclScanResults[i].size);
+    else
+        wclScanResultCount++;
+    memcpy(wclScanResults[i].bssid, metadata->bssid, 6);
+    wclScanResults[i].channel = uint8_t(metadata->channel);
+    wclScanResults[i].size = uint32_t(size);
+    wclScanResults[i].data = data;
+}
+
+void AirportItlwmSkywalkInterface::clearWCLScanResults()
+{
+    for (unsigned i = 0; i < wclScanResultCount; i++)
+        IOFree(wclScanResults[i].data, wclScanResults[i].size);
+    bzero(wclScanResults, sizeof(wclScanResults));
+    wclScanResultCount = 0;
 }
 
 void AirportItlwmSkywalkInterface::clearWCLPMKSA()

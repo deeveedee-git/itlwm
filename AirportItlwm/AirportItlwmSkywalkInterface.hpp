@@ -452,6 +452,8 @@ private:
     void finishWCLScan(IOReturn);
     void finishWCLJoin(uint16_t, uint16_t, IOReturn);
     void publishWCLBeacon(const ieee80211_node *, const uint8_t *, size_t);
+    void keepWCLScanResult(const AirportWCL::BeaconMetadata *, size_t);
+    void clearWCLScanResults();
     IOTimerEventSource *joinTimer;
     uint8_t joinBSSID[6];
     bool scanPending;
@@ -460,6 +462,17 @@ private:
     // A scan request held while the firmware restarts (resumeWCLScan).
     bool scanDeferred = false;
     AirportWCL::ScanRequest deferredScan = {};
+    // The latest result per BSS of the scan request in progress, posted again
+    // just before ScanDone (see finishWCLScan).
+    struct WCLScanResultCopy {
+        uint8_t bssid[6];
+        uint8_t channel;
+        uint32_t size;
+        void *data;
+    };
+    static constexpr unsigned kWCLScanResultCopies = 96;
+    WCLScanResultCopy wclScanResults[kWCLScanResultCopies] = {};
+    unsigned wclScanResultCount = 0;
     bool wclBssValid;
     bool wclLinkIndicated;
     uint8_t wclBssInfo[sizeof(AirportWCL::BeaconMetadata) + 0x800];
