@@ -729,6 +729,14 @@ IOReturn AirportItlwmSkywalkInterface::leaveWCLNetwork()
     wclBssValid = false;
     disassocIsVoluntary = true;
     ic->ic_deauth_reason = IEEE80211_REASON_AUTH_LEAVE;
+    /*
+     * Tell the AP we're leaving. RUN -> SCAN is net80211's beacon-miss path
+     * and sends nothing, so the AP kept our session (Wi-Fi off, sleep, MAC
+     * change) and answered the next authentication with a disassoc
+     * (reason 8), costing ~4 s per join. As setDISASSOCIATE does.
+     */
+    if (ic->ic_state > IEEE80211_S_AUTH && ic->ic_bss != NULL)
+        IEEE80211_SEND_MGMT(ic, ic->ic_bss, IEEE80211_FC0_SUBTYPE_DEAUTH, IEEE80211_REASON_AUTH_LEAVE);
     if (ic->ic_state > IEEE80211_S_SCAN)
         ieee80211_new_state(ic, IEEE80211_S_SCAN, -1);
     ieee80211_disable_rsn(ic);
