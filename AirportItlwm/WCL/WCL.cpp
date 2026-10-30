@@ -755,9 +755,11 @@ IOReturn AirportItlwmSkywalkInterface::leaveWCLNetwork()
 }
 
 /*
- * Wait (up to 20 ms) until the leave deauth has been transmitted. Leaving
+ * Wait (up to 150 ms) until the leave deauth has been transmitted. Leaving
  * RUN flushes the Tx path and the system may stop the card right after; the
- * deauth needs ~3-4 ms and was lost when either came first.
+ * deauth needs ~1-4 ms and was lost when either came first. During a
+ * background scan the radio is away for ~120 ms per channel and the frame
+ * waits for it to return.
  */
 void AirportItlwmSkywalkInterface::waitWCLDeauthTx()
 {
@@ -769,7 +771,7 @@ void AirportItlwmSkywalkInterface::waitWCLDeauthTx()
         ieee80211com *ic = static_cast<ieee80211com *>(a0);
         IOCommandGate *gate = static_cast<IOCommandGate *>(a1);
         AbsoluteTime deadline;
-        clock_interval_to_deadline(20, kMillisecondScale, reinterpret_cast<uint64_t *>(&deadline));
+        clock_interval_to_deadline(150, kMillisecondScale, reinterpret_cast<uint64_t *>(&deadline));
         while (ic->ic_deauth_tx_pending)
             if (gate->commandSleep(&ic->ic_deauth_tx_pending, deadline, THREAD_UNINT) != THREAD_AWAKENED)
                 break;
