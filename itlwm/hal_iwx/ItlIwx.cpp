@@ -10513,6 +10513,20 @@ iwx_newstate_task(void *psc)
                     splx(s);
                     return;
                 }
+                /*
+                 * A long all-passive scan request sent within ~2 ms of an
+                 * abort can make the UMAC assert (0x20002806) ~9 ms later.
+                 * Give the firmware 20 ms after the abort before the
+                 * restarted scan.
+                 */
+                if (aborted && err == 0) {
+                    int never = 0;
+                    that->iwx_wait_notification(sc, &never, 1, 20);
+                    if (generation != sc->sc_generation) {
+                        splx(s);
+                        return;
+                    }
+                }
                 if (err == 0) {
                     ic->ic_scan_restart = false;
                     goto next_scan;
